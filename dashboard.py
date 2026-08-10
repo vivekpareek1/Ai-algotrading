@@ -44,10 +44,19 @@ def get_dashboard_password():
 def render_page(rm: RiskManager) -> str:
     status = rm.get_status()
     positions = rm.list_open_positions()
+    journal = rm.list_recent_journal(limit=100)
 
-    blocked = status["blocked_for_today"]
-    badge_color = "#dc2626" if blocked else "#16a34a"
-    badge_text = "TRADING BLOCKED" if blocked else "TRADING ACTIVE"
+    engine_on = status["engine_active"]
+    kill_blocked = status["blocked_for_today"]
+
+    if not engine_on:
+        badge_color, badge_text = "#64748b", "ENGINE OFF"
+    elif kill_blocked:
+        badge_color, badge_text = "#dc2626", "TRADING BLOCKED (daily loss limit)"
+    else:
+        badge_color, badge_text = "#16a34a", "ENGINE ON — TRADING ACTIVE"
+
+    blocked = kill_blocked  # kept for the existing unblock-button logic below
 
     pnl = status["realized_pnl_today"]
     pnl_color = "#16a34a" if pnl >= 0 else "#dc2626"
@@ -83,6 +92,58 @@ def render_page(rm: RiskManager) -> str:
         <p style="color:#888;font-size:12px;">Only override this if you understand why the
         limit fired. It exists to protect you.</p>
         """
+
+    if engine_on:
+        engine_toggle = """
+        <button onclick="toggleEngine('off')" style="background:#dc2626;color:white;border:none;
+        padding:12px 24px;border-radius:6px;cursor:pointer;font-size:15px;font-weight:600;">
+            Turn Engine OFF
+        </button>
+        """
+    else:
+        engine_toggle = """
+        <button onclick="toggleEngine('on')" style="background:#16a34a;color:white;border:none;
+        padding:12px 24px;border-radius:6px;cursor:pointer;font-size:15px;font-weight:600;">
+            Turn Engine ON
+        </button>
+        <p style="color:#888;font-size:12px;margin-top:8px;">No trades are approved while the
+        engine is off, no matter what your strategies signal.</p>
+        """
+
+    EVENT_COLORS = {
+        "APPROVED": "#16a34a", "OPENED": "#16a34a", "CLOSED": "#3b82f6",
+        "BLOCKED": "#dc2626", "KILL_SWITCH": "#dc2626",
+        "RESERVATION_EXPIRED": "#f59e0b", "RESERVATION_CANCELLED": "#f59e0b",
+        "MANUAL_UNBLOCK": "#a855f7", "ENGINE_ACTIVATED": "#16a34a",
+        "ENGINE_DEACTIVATED": "#64748b",
+    }
+    journal_rows = ""
+    if journal:
+        for row in journal:
+            ev = row.get("event", "")
+            color = EVENT_COLORS.get(ev, "#94a3b8")
+            ts = row.get("timestamp", "")[:19].replace("T", " ")
+            row_pnl = row.get("pnl", "")   # NOTE: must not be named `pnl` — that
+            pnl_html = ""                  # name is also used below for the
+            if row_pnl:                    # card's numeric P&L; Python has no
+                try:                        # block scope, so reusing it here
+                    pnl_f = float(row_pnl)  # silently corrupted the card value
+                    pnl_html = f'<span style="color:{"#16a34a" if pnl_f>=0 else "#dc2626"}">Rs.{pnl_f:,.0f}</span>'
+                except ValueError:
+                    pass
+            journal_rows += f"""
+            <tr>
+                <td>{ts}</td>
+                <td><span style="color:{color};font-weight:600;">{ev}</span></td>
+                <td>{row.get('strategy','')}</td>
+                <td>{row.get('symbol','')}</td>
+                <td>{row.get('direction','')}</td>
+                <td>{row.get('quantity','')}</td>
+                <td>{pnl_html}</td>
+                <td style="color:#94a3b8;font-size:12px;max-width:280px;">{row.get('reason','')}</td>
+            </tr>"""
+    else:
+        journal_rows = '<tr><td colspan="8" style="text-align:center;color:#888;">No activity yet</td></tr>'
 
     return f"""<!DOCTYPE html>
 <html>
@@ -125,6 +186,10 @@ def render_page(rm: RiskManager) -> str:
   {f'<div class="reason-box">{status["block_reason"]}</div>' if blocked else ''}
   {unblock_button}
 
+  <div style="margin-top:18px;">
+    {engine_toggle}
+  </div>
+
   <div class="grid">
     <div class="card"><div class="label">Total Capital</div><div class="value">Rs.{status['total_capital']:,.0f}</div></div>
     <div class="card"><div class="label">Realized P&amp;L Today</div><div class="value" style="color:{pnl_color}">Rs.{pnl:,.0f}</div></div>
@@ -153,6 +218,15 @@ def render_page(rm: RiskManager) -> str:
     </table>
   </section>
 
+  <section>
+    <h2>Trade History — every decision, taken or not (most recent first)</h2>
+    <table>
+      <tr><th>Time</th><th>Event</th><th>Strategy</th><th>Symbol</th><th>Dir</th>
+          <th>Qty</th><th>P&amp;L</th><th>Reason / Note</th></tr>
+      {journal_rows}
+    </table>
+  </section>
+
   <div class="footer">Risk & Position-Sizing Module &middot; refreshes automatically</div>
 </div>
 
@@ -161,6 +235,13 @@ setTimeout(() => location.reload(), 5000);
 function unblock() {{
   if (!confirm("Are you sure you want to unblock trading? Only do this if you understand why the daily loss limit fired.")) return;
   fetch('/api/unblock', {{method: 'POST'}}).then(() => location.reload());
+}}
+function toggleEngine(state) {{
+  const msg = state === 'on'
+    ? "Turn the engine ON? Strategies will be able to place real trades from now on."
+    : "Turn the engine OFF? No new trades will be approved until you turn it back on.";
+  if (!confirm(msg)) return;
+  fetch('/api/engine/' + state, {{method: 'POST'}}).then(() => location.reload());
 }}
 </script>
 </body>
@@ -218,6 +299,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/unblock":
             rm = RiskManager(str(CONFIG_PATH))
             rm.force_unblock(reason="manual override via dashboard")
+            self.send_response(200)
+            self.end_headers()
+        elif self.path == "/api/engine/on":
+            rm = RiskManager(str(CONFIG_PATH))
+            rm.activate_engine(reason="turned on via dashboard")
+            self.send_response(200)
+            self.end_headers()
+        elif self.path == "/api/engine/off":
+            rm = RiskManager(str(CONFIG_PATH))
+            rm.deactivate_engine(reason="turned off via dashboard")
             self.send_response(200)
             self.end_headers()
         else:

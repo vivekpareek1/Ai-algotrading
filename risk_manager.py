@@ -164,6 +164,7 @@ class RiskManager:
         self.state.setdefault("realized_pnl_today", 0.0)
         self.state.setdefault("blocked_for_today", False)
         self.state.setdefault("block_reason", None)
+        self.state.setdefault("engine_active", False)
         self.state.pop("strategy_capital_used", None)  # fix #7: now derived
 
     def _blank_state(self):
@@ -175,6 +176,7 @@ class RiskManager:
             "open_positions": {},
             "reservations": {},
             "marks": {},          # trade_id -> last known market price
+            "engine_active": False,   # starts OFF — you must manually activate
         }
 
     def _write_state_atomic(self):
@@ -387,6 +389,14 @@ class RiskManager:
         per_lot_value = entry_price * lot_size
 
         with self._locked():
+            if not self.state.get("engine_active", False):
+                reason = ("Engine is OFF. No trades are approved until you activate "
+                          "it manually (dashboard or activate_engine()).")
+                self._journal("BLOCKED", strategy=strategy_name, symbol=symbol,
+                              direction=direction, entry_price=entry_price,
+                              stop_loss_price=stop_loss_price, reason=reason)
+                return reject(reason)
+
             if self.state["blocked_for_today"]:
                 reason = self.state["block_reason"]
                 self._journal("BLOCKED", strategy=strategy_name, symbol=symbol,
@@ -611,6 +621,7 @@ class RiskManager:
             marked = sum(1 for t in self.state["open_positions"] if t in self.state["marks"])
             return {
                 "trading_day": self.state["trading_day"],
+                "engine_active": self.state.get("engine_active", False),
                 "total_capital": capital,
                 "realized_pnl_today": round(realized, 2),
                 "realized_pnl_today_pct": round(100 * realized / capital, 3),
@@ -635,6 +646,35 @@ class RiskManager:
     def list_open_positions(self):
         with self._locked():
             return dict(self.state["open_positions"])
+
+    def list_recent_journal(self, limit=50):
+        """Every trade decision — approved, blocked, opened, closed, engine
+        on/off — most recent first. This is what 'did it take a trade or
+        not' actually means: read from here, not just open_positions."""
+        if not self.journal_path.exists():
+            return []
+        with open(self.journal_path, "r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        return list(reversed(rows))[:limit]
+
+    def activate_engine(self, reason="manual activation"):
+        """Turn trading ON. No trade is approved while the engine is off —
+        this is the switch you control yourself, separate from the daily
+        loss kill switch."""
+        with self._locked():
+            self.state["engine_active"] = True
+            self._journal("ENGINE_ACTIVATED", reason=reason)
+
+    def deactivate_engine(self, reason="manual deactivation"):
+        """Turn trading OFF. Does not touch open positions — only blocks
+        NEW trades from being approved."""
+        with self._locked():
+            self.state["engine_active"] = False
+            self._journal("ENGINE_DEACTIVATED", reason=reason)
+
+    def is_engine_active(self):
+        with self._locked():
+            return self.state.get("engine_active", False)
 
     def force_unblock(self, reason="manual override"):
         """Manual override of today's block. Use with care — the limit exists
