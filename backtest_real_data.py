@@ -126,7 +126,7 @@ def compute_indicators(df):
 # Signal generation (confluence scoring)
 # ----------------------------------------------------------------- #
 
-def raw_regime(row):
+def raw_regime(row, adx_threshold=20):
     """Score bullish vs bearish confluence factors. Returns UP, DOWN, or FLAT."""
     if pd.isna(row["adx14"]) or pd.isna(row["vwap"]):
         return "FLAT"
@@ -159,7 +159,7 @@ def raw_regime(row):
         bear_score += 1
 
     # ADX trend strength gate — no regime without a real trend
-    if row["adx14"] < 20:
+    if row["adx14"] < adx_threshold:
         return "FLAT"
 
     if bull_score >= 3:
@@ -223,8 +223,32 @@ class SimClock:
         return self.current
 
 
-def run_backtest(df, config_path, min_lots=1):
+def print_diagnostics(df, adx_threshold):
+    """Always printed — shows WHY zero (or few) trades happened, instead of
+    leaving you to guess or dig through the journal manually."""
+    valid = df.dropna(subset=["adx14", "vwap"])
+    print("\n" + "-" * 60)
+    print("SIGNAL DIAGNOSTICS")
+    print("-" * 60)
+    print(f"Total bars: {len(df)}, usable after indicator warmup: {len(valid)}")
+    above_adx = (valid["adx14"] >= adx_threshold).sum()
+    print(f"Bars with ADX >= {adx_threshold}: {above_adx} "
+          f"({100*above_adx/len(valid):.1f}% of usable bars)")
+    print(f"ADX distribution — min: {valid['adx14'].min():.1f}, "
+          f"median: {valid['adx14'].median():.1f}, "
+          f"75th pct: {valid['adx14'].quantile(0.75):.1f}, "
+          f"max: {valid['adx14'].max():.1f}")
+
+    regimes = valid.apply(lambda r: raw_regime(r, adx_threshold), axis=1)
+    counts = regimes.value_counts()
+    print(f"\nRaw regime counts (before the {CONFIRM_BARS}-bar confirmation filter):")
+    print(counts.to_string())
+    print("-" * 60)
+
+
+def run_backtest(df, config_path, min_lots=1, adx_threshold=20):
     df = compute_indicators(df)
+    print_diagnostics(df, adx_threshold)
     confirmer = RegimeConfirmer()
 
     # bootstrap: read config to get the configured timezone before the
@@ -249,7 +273,7 @@ def run_backtest(df, config_path, min_lots=1):
         if pd.isna(row["atr14"]) or pd.isna(row["adx14"]):
             continue  # not enough warmup data yet
 
-        raw = raw_regime(row)
+        raw = raw_regime(row, adx_threshold)
         regime = confirmer.update(raw)
         today = row["timestamp"].date()
 
@@ -362,11 +386,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv", default="nifty_historical_1year.csv")
     parser.add_argument("--config", default="config.json")
+    parser.add_argument("--adx-threshold", type=float, default=20,
+                         help="Lower this (e.g. 15) if diagnostics show real "
+                              "ADX rarely reaches 20 on this timeframe.")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv, parse_dates=["timestamp"])
     print(f"Loaded {len(df)} candles from {args.csv}")
     print(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
 
-    trades, rm = run_backtest(df, args.config)
+    trades, rm = run_backtest(df, args.config, adx_threshold=args.adx_threshold)
     print_report(trades, rm)
