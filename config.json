@@ -1,0 +1,27 @@
+{
+  "_comment": "EDIT THESE VALUES with your real numbers before running live",
+
+  "total_capital": 1000000,
+  "_total_capital_comment": "Total trading capital in Rs, shared across ALL strategies (Nifty indicator, arbitrage scanner, MCX toolkit)",
+
+  "risk_per_trade_pct": 1.5,
+  "_risk_per_trade_pct_comment": "Max % of total capital risked on ANY single trade (stop-loss distance x quantity). Recommended 1-2%.",
+
+  "max_daily_loss_pct": 3.0,
+  "_max_daily_loss_pct_comment": "When today's realized loss reaches this % of total capital, ALL new trades are blocked for the rest of the day. Open positions are NOT auto-closed.",
+
+  "max_concurrent_open_risk_pct": 6.0,
+  "_max_concurrent_open_risk_pct_comment": "Max combined risk (sum of all open positions' stop-loss risk) allowed at once, across all strategies. Prevents overexposure even if daily loss limit hasn't been hit yet. Recommended 2-4x your per-trade risk.",
+
+  "strategies": {
+    "nifty_options_indicator": { "enabled": true, "max_share_of_capital_pct": 100 },
+    "nifty_arbitrage_scanner": { "enabled": true, "max_share_of_capital_pct": 100 },
+    "mcx_gold_silver": { "enabled": true, "max_share_of_capital_pct": 100 }
+  },
+  "_strategies_comment": "max_share_of_capital_pct lets you cap how much of total_capital one strategy can use at once. 100 = no extra cap beyond the shared risk limits above. Lower this if you want e.g. MCX to never use more than 40% of capital.",
+
+  "timezone": "Asia/Kolkata",
+  "trading_day_reset_time": "09:00",
+  "state_file": "risk_state.json",
+  "journal_file": "trade_journal.csv"
+}
