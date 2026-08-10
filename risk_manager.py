@@ -82,9 +82,16 @@ RESERVATION_TTL_SECONDS = 180
 
 
 class RiskManager:
-    def __init__(self, config_path="config.json"):
+    def __init__(self, config_path="config.json", clock=None):
+        """clock: optional callable returning the current tz-aware datetime.
+        Used for backtesting, where 'now' must follow simulated historical
+        timestamps instead of the real wall clock — otherwise the daily
+        loss kill switch and trading-day rollover would use TODAY's real
+        date for every simulated day, which is wrong. Leave as None for
+        live/normal use (uses the real clock)."""
         self.config_path = Path(config_path).resolve()
         self._load_config()
+        self._clock_fn = clock
 
         self.tz = _get_tz(self.config.get("timezone", "Asia/Kolkata"))
         base = self.config_path.parent
@@ -199,6 +206,8 @@ class RiskManager:
     # ------------------------------------------------------------------ #
 
     def _now(self):
+        if self._clock_fn is not None:
+            return self._clock_fn()
         return datetime.now(self.tz)
 
     def _trading_day_str(self):
