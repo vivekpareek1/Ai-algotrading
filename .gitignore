@@ -3,3 +3,5 @@ risk_state.json.lock
 trade_journal.csv
 __pycache__/
 *.pyc
+angel_credentials.json
+nifty_historical_1year.csv
