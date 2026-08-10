@@ -36,12 +36,20 @@ script automatically fetches in chunks and stitches them together.
 
 import json
 import time
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 import pyotp
+import logzero
 from SmartApi import SmartConnect
+
+# CRITICAL: the smartapi-python library logs your full request — including
+# your password in plain text — to the screen whenever a login attempt
+# fails. This silences that specific behavior so a failed login can never
+# print your password again, no matter what error Angel One returns.
+logzero.loglevel(logging.CRITICAL)
 
 CREDS_PATH = Path(__file__).parent / "angel_credentials.json"
 OUTPUT_CSV = Path(__file__).parent / "nifty_historical_1year.csv"
@@ -80,7 +88,11 @@ def login():
     data = obj.generateSession(creds["client_code"], creds["password"], totp)
 
     if not data.get("status"):
-        raise RuntimeError(f"Login failed: {data}")
+        # Deliberately NOT including creds or the raw 'data' dict's request
+        # portion here — only Angel's own status/message/errorcode, which
+        # never contain your password.
+        safe_info = {k: data.get(k) for k in ("status", "message", "errorcode")}
+        raise RuntimeError(f"Login failed: {safe_info}")
 
     print("Logged in successfully.")
     return obj
