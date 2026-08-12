@@ -9,3 +9,5 @@ instrument_master_cache.json
 risk_state_backtest.json
 risk_state_backtest.json.lock
 trade_journal_backtest.csv
+email_credentials.json
+backups/
