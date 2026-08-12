@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 angel_credentials.json
 nifty_historical_1year.csv
+instrument_master_cache.json
