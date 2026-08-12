@@ -11,3 +11,7 @@ risk_state_backtest.json.lock
 trade_journal_backtest.csv
 email_credentials.json
 backups/
+data/
+cache/
+logs/
+nse_holidays.txt
