@@ -100,9 +100,18 @@ def adx(df, period=14):
 
 
 def session_vwap(df):
-    """VWAP resets every trading day."""
+    """VWAP resets every trading day. Falls back to an unweighted running
+    session average of typical price when volume is entirely zero — index
+    data (like NIFTY spot/futures candles from Angel One) has no real
+    volume, since the index itself isn't traded, only its constituents."""
     day = df["timestamp"].dt.date
     typical = (df["high"] + df["low"] + df["close"]) / 3
+
+    if df["volume"].sum() == 0:
+        cum_typical = typical.groupby(day).cumsum()
+        cum_count = typical.groupby(day).cumcount() + 1
+        return cum_typical / cum_count
+
     pv = typical * df["volume"]
     cum_pv = pv.groupby(day).cumsum()
     cum_vol = df["volume"].groupby(day).cumsum()
