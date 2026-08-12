@@ -165,119 +165,152 @@ def get_recent_candles(obj, token, exchange="NSE", interval="FIFTEEN_MINUTE", da
     return df
 
 
-def main():
-    print("=" * 60)
-    print("PAPER TRADING ENGINE — no real orders will be placed")
-    print("=" * 60)
-
-    if not is_market_open():
-        print(f"\nMarket is currently closed (runs {MARKET_OPEN}-{MARKET_CLOSE} IST, Mon-Fri).")
-        print("Exiting. Run this again during market hours.")
-        return
-
-    obj = login()
-    instruments = load_instrument_master()
-
-    rm = RiskManager(str(CONFIG_PATH))
-    if not rm.is_engine_active():
-        rm.activate_engine(reason="paper_trade.py session")
-
+def run_trading_session(obj, instruments, rm):
+    """Runs the intraday trading loop for one session (one market day),
+    until the market closes or a fatal error occurs. Returns normally when
+    the day ends — the caller loops back and waits for the next day."""
     NIFTY_TOKEN = "99926000"
     confirmer = RegimeConfirmer()
     prev_regime = "FLAT"
     open_trade = None
 
-    print("\nStarting main loop. Press Ctrl+C to stop.\n")
+    while is_market_open():
+        df = get_recent_candles(obj, NIFTY_TOKEN)
+        df = compute_indicators(df)
+        last_row = df.iloc[-1]
 
-    try:
-        while is_market_open():
-            df = get_recent_candles(obj, NIFTY_TOKEN)
-            df = compute_indicators(df)
-            last_row = df.iloc[-1]
+        if pd.isna(last_row["atr14"]) or pd.isna(last_row["adx14"]):
+            print("Not enough data yet for indicators, waiting...")
+            time.sleep(POLL_SECONDS)
+            continue
 
-            if pd.isna(last_row["atr14"]) or pd.isna(last_row["adx14"]):
-                print("Not enough data yet for indicators, waiting...")
+        raw = raw_regime(last_row)
+        regime = confirmer.update(raw)
+        spot = last_row["close"]
+        now_str = datetime.now(IST).strftime("%H:%M:%S")
+
+        # --- manage open paper trade ---
+        if open_trade is not None:
+            try:
+                current_premium = get_ltp(obj, "NFO", open_trade["symbol"], open_trade["token"])
+            except Exception as e:
+                print(f"[{now_str}] Could not fetch LTP for open position: {e}")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            raw = raw_regime(last_row)
-            regime = confirmer.update(raw)
-            spot = last_row["close"]
-            now_str = datetime.now(IST).strftime("%H:%M:%S")
+            hit_sl = current_premium <= open_trade["sl_premium"]
+            hit_target = current_premium >= open_trade["target_premium"]
+            near_close = datetime.now(IST).time() >= dtime(15, 20)
 
-            # --- manage open paper trade ---
-            if open_trade is not None:
-                try:
-                    current_premium = get_ltp(obj, "NFO", open_trade["symbol"], open_trade["token"])
-                except Exception as e:
-                    print(f"[{now_str}] Could not fetch LTP for open position: {e}")
-                    time.sleep(POLL_SECONDS)
-                    continue
+            print(f"[{now_str}] Open {open_trade['direction']} {open_trade['symbol']}: "
+                  f"premium={current_premium:.2f} (entry={open_trade['entry_premium']:.2f}, "
+                  f"SL={open_trade['sl_premium']:.2f}, target={open_trade['target_premium']:.2f})")
 
-                hit_sl = current_premium <= open_trade["sl_premium"]
-                hit_target = current_premium >= open_trade["target_premium"]
-                near_close = datetime.now(IST).time() >= dtime(15, 20)
+            if hit_sl or hit_target or near_close:
+                pnl = rm.record_close(open_trade["trade_id"], current_premium)
+                reason = "SL" if hit_sl else ("TARGET" if hit_target else "EOD")
+                print(f"[{now_str}] CLOSED ({reason}): P&L = Rs.{pnl:,.2f}")
+                open_trade = None
 
-                print(f"[{now_str}] Open {open_trade['direction']} {open_trade['symbol']}: "
-                      f"premium={current_premium:.2f} (entry={open_trade['entry_premium']:.2f}, "
-                      f"SL={open_trade['sl_premium']:.2f}, target={open_trade['target_premium']:.2f})")
+        # --- look for new entry ---
+        elif regime != "FLAT" and regime != prev_regime:
+            direction = "CE" if regime == "UP" else "PE"
+            strike = round_to_strike(spot)
+            try:
+                symbol, token = find_option_contract(instruments, "NIFTY", strike, direction)
+                entry_premium = get_ltp(obj, "NFO", symbol, token)
+            except Exception as e:
+                print(f"[{now_str}] Could not get option contract/price: {e}")
+                prev_regime = regime
+                time.sleep(POLL_SECONDS)
+                continue
 
-                if hit_sl or hit_target or near_close:
-                    pnl = rm.record_close(open_trade["trade_id"], current_premium)
-                    reason = "SL" if hit_sl else ("TARGET" if hit_target else "EOD")
-                    print(f"[{now_str}] CLOSED ({reason}): P&L = Rs.{pnl:,.2f}")
-                    open_trade = None
+            sl_distance = last_row["atr14"] * 1.0 * 0.5  # delta-adjusted for SL only
+            target_distance = last_row["atr14"] * 1.5 * 0.5
+            sl_premium = max(1.0, entry_premium - sl_distance)
+            target_premium = entry_premium + target_distance
 
-            # --- look for new entry ---
-            elif regime != "FLAT" and regime != prev_regime:
-                direction = "CE" if regime == "UP" else "PE"
-                strike = round_to_strike(spot)
-                try:
-                    symbol, token = find_option_contract(instruments, "NIFTY", strike, direction)
-                    entry_premium = get_ltp(obj, "NFO", symbol, token)
-                except Exception as e:
-                    print(f"[{now_str}] Could not get option contract/price: {e}")
-                    prev_regime = regime
-                    time.sleep(POLL_SECONDS)
-                    continue
+            decision = rm.size_trade(
+                strategy_name="nifty_options_indicator",
+                entry_price=entry_premium, stop_loss_price=sl_premium,
+                lot_size=LOT_SIZE, symbol=symbol, direction="BUY",
+            )
 
-                sl_distance = last_row["atr14"] * 1.0 * 0.5  # delta-adjusted for SL only
-                target_distance = last_row["atr14"] * 1.5 * 0.5
-                sl_premium = max(1.0, entry_premium - sl_distance)
-                target_premium = entry_premium + target_distance
-
-                decision = rm.size_trade(
-                    strategy_name="nifty_options_indicator",
-                    entry_price=entry_premium, stop_loss_price=sl_premium,
-                    lot_size=LOT_SIZE, symbol=symbol, direction="BUY",
+            if decision["approved"]:
+                trade_id = rm.record_open(
+                    strategy_name="nifty_options_indicator", symbol=symbol,
+                    direction="BUY", entry_price=entry_premium,
+                    stop_loss_price=sl_premium, quantity=decision["quantity"],
+                    reservation_id=decision["reservation_id"],
                 )
+                open_trade = {
+                    "trade_id": trade_id, "symbol": symbol, "token": token,
+                    "direction": direction, "entry_premium": entry_premium,
+                    "sl_premium": sl_premium, "target_premium": target_premium,
+                }
+                print(f"[{now_str}] PAPER ENTRY: {direction} {symbol} @ Rs.{entry_premium:.2f} "
+                      f"(qty={decision['quantity']}, risk=Rs.{decision['risk_amount']:.0f})")
+            else:
+                print(f"[{now_str}] Signal fired but blocked: {decision['reason']}")
 
-                if decision["approved"]:
-                    trade_id = rm.record_open(
-                        strategy_name="nifty_options_indicator", symbol=symbol,
-                        direction="BUY", entry_price=entry_premium,
-                        stop_loss_price=sl_premium, quantity=decision["quantity"],
-                        reservation_id=decision["reservation_id"],
-                    )
-                    open_trade = {
-                        "trade_id": trade_id, "symbol": symbol, "token": token,
-                        "direction": direction, "entry_premium": entry_premium,
-                        "sl_premium": sl_premium, "target_premium": target_premium,
-                    }
-                    print(f"[{now_str}] PAPER ENTRY: {direction} {symbol} @ Rs.{entry_premium:.2f} "
-                          f"(qty={decision['quantity']}, risk=Rs.{decision['risk_amount']:.0f})")
-                else:
-                    print(f"[{now_str}] Signal fired but blocked: {decision['reason']}")
+        prev_regime = regime
+        time.sleep(POLL_SECONDS)
 
-            prev_regime = regime
-            time.sleep(POLL_SECONDS)
+    # session ended (market closed) — if a trade is still open, that
+    # shouldn't normally happen (near_close should have closed it), but
+    # as a safety net, warn loudly rather than silently carrying it over
+    if open_trade is not None:
+        print(f"WARNING: session ended with an open trade ({open_trade['symbol']}) "
+              f"that wasn't closed by the near_close check. It will be re-evaluated "
+              f"tomorrow — check the dashboard.")
 
-    except KeyboardInterrupt:
-        print("\n\nStopped by user.")
 
-    print("\nFinal status:")
-    print(json.dumps(rm.get_status(), indent=2))
+def main():
+    """Runs forever as a background service: waits for market hours, trades
+    through the session, then waits for the next trading day. Designed to
+    run under systemd with Restart=always, so it survives crashes too."""
+    print("=" * 60)
+    print("PAPER TRADING ENGINE (24/7 daemon) — no real orders will be placed")
+    print("=" * 60)
+
+    rm = RiskManager(str(CONFIG_PATH))
+    if not rm.is_engine_active():
+        rm.activate_engine(reason="paper_trade.py session")
+
+    instruments = None
+    last_instrument_refresh_day = None
+
+    while True:
+        if not is_market_open():
+            now = datetime.now(IST)
+            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Market closed. "
+                  f"Waiting... (checks every 5 min)")
+            time.sleep(300)
+            continue
+
+        today = datetime.now(IST).date()
+        try:
+            obj = login()
+            if instruments is None or last_instrument_refresh_day != today:
+                instruments = load_instrument_master()
+                last_instrument_refresh_day = today
+
+            print(f"\n[{datetime.now(IST).strftime('%H:%M:%S')}] "
+                  f"Market open — starting today's session.\n")
+            run_trading_session(obj, instruments, rm)
+            print(f"\n[{datetime.now(IST).strftime('%H:%M:%S')}] "
+                  f"Session ended (market closed for today).")
+
+        except Exception as e:
+            # don't let one bad error kill the whole daemon — log it,
+            # wait a bit, and let the outer loop retry
+            print(f"ERROR in trading session: {e}")
+            print("Waiting 60s before retrying...")
+            time.sleep(60)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nStopped by user (Ctrl+C).")
