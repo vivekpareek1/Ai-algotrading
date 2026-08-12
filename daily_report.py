@@ -79,6 +79,21 @@ def build_report_text(days_back=1):
         lines.append(f"Wins / Losses: {wins} / {losses}")
         lines.append(f"Win rate: {win_rate:.1f}%")
         lines.append(f"Total P&L (closed trades): Rs.{total_pnl:,.2f}")
+
+        lines.append(f"\nPer-trade breakdown:")
+        lines.append(f"{'Time':<17}{'Symbol':<24}{'Dir':<6}{'Entry':>10}{'Exit':>10}{'P&L':>12}")
+        for _, row in closed.sort_values("timestamp").iterrows():
+            t = row["timestamp"].strftime("%m-%d %H:%M")
+            symbol = str(row.get("symbol", ""))[:22]
+            direction = str(row.get("direction", ""))
+            entry = row.get("entry_price", "")
+            exitp = row.get("exit_price", "")
+            pnl = row["pnl"]
+            entry_s = f"{float(entry):.2f}" if entry not in ("", None) and pd.notna(entry) else "-"
+            exit_s = f"{float(exitp):.2f}" if exitp not in ("", None) and pd.notna(exitp) else "-"
+            pnl_s = f"{pnl:+,.2f}" if pd.notna(pnl) else "-"
+            lines.append(f"{t:<17}{symbol:<24}{direction:<6}{entry_s:>10}{exit_s:>10}{pnl_s:>12}")
+
         if "reason" in closed.columns:
             non_empty_reasons = closed["reason"].dropna()
             non_empty_reasons = non_empty_reasons[non_empty_reasons.astype(str).str.strip() != ""]
