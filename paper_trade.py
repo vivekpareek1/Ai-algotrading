@@ -49,9 +49,13 @@ logzero.loglevel(logging.CRITICAL)  # same credential-leak protection as fetch_h
 sys.path.insert(0, str(Path(__file__).parent))
 from backtest_real_data import compute_indicators, raw_regime, RegimeConfirmer, LOT_SIZE
 from risk_manager import RiskManager
+from signal_engine import SignalEngine, StructureAnalyzer, Direction
+from exit_manager import ExitManager, ExitConfig, Position, MarketState, Side, Action
+from entry_sizing import plan_stops, SizingConfig
 
 CREDS_PATH = Path(__file__).parent / "angel_credentials.json"
 CONFIG_PATH = Path(__file__).parent / "config.json"
+DATA_DIR = Path(__file__).parent / "data"   # where oi_collector writes
 INSTRUMENT_MASTER_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
 INSTRUMENT_CACHE = Path(__file__).parent / "instrument_master_cache.json"
 POLL_SECONDS = 30  # how often to check price while a trade is open
@@ -165,6 +169,110 @@ def get_recent_candles(obj, token, exchange="NSE", interval="FIFTEEN_MINUTE", da
     return df
 
 
+REQUIRE_STRUCTURE = True   # refuse to trade on price alone — see load_structure()
+
+
+def load_structure(underlying="NIFTY"):
+    """
+    Read the latest market-structure snapshot written by oi_collector.
+    Returns (StructureRead, None) or (None, reason).
+
+    WHY ITS ABSENCE BLOCKS TRADING: the price-only confluence measured ~48% on
+    a year of real data — barely a coin flip, and that figure assumed no theta
+    decay, so live it is worse. Structure data is what the entry filter relies
+    on. Falling back to price-only when the collector is down would silently
+    resume trading the strategy we already know does not work.
+    """
+    day = datetime.now(IST).strftime("%Y-%m-%d")
+    path = DATA_DIR / underlying / f"summary_{day}.csv"
+    if not path.exists():
+        return None, f"no collector data at {path} — is oi-collector running?"
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        return None, f"could not read {path}: {e}"
+    if df.empty:
+        return None, f"{path} empty — collector has not written a snapshot yet"
+    try:
+        return StructureAnalyzer().read_summary(df), None
+    except Exception as e:
+        return None, f"could not parse structure data: {e}"
+
+
+def open_new_trade(obj, instruments, rm, signal_eng, exit_mgr, last_row, spot, regime, now_str):
+    """Price proposes a direction, structure can veto it, then stop levels are
+    reconciled so the reserved risk matches the stop that will actually fire.
+    Returns an open_trade dict, or None."""
+    price_direction = Direction.BULLISH if regime == "UP" else Direction.BEARISH
+    atr = float(last_row["atr14"])
+
+    structure, err = load_structure("NIFTY")
+    if structure is None:
+        if REQUIRE_STRUCTURE:
+            print(f"[{now_str}] {price_direction.value} price signal IGNORED — {err}")
+            return None
+        print(f"[{now_str}] WARNING trading without structure data: {err}")
+    else:
+        sig = signal_eng.decide(price_direction, structure, atr)
+        print(f"[{now_str}] {sig.reason}")
+        for v in sig.vetoes:
+            print(f"[{now_str}]    veto: {v}")
+        if not sig.take_trade:
+            return None
+
+    direction = "CE" if price_direction is Direction.BULLISH else "PE"
+    try:
+        symbol, token = find_option_contract(instruments, "NIFTY",
+                                             round_to_strike(spot), direction)
+        entry_premium = get_ltp(obj, "NFO", symbol, token)
+    except Exception as e:
+        print(f"[{now_str}] Could not get option contract/price: {e}")
+        return None
+
+    # exit_manager stops on the underlying, risk_manager sizes on premium.
+    # plan_stops() decides which stop binds first and returns the premium
+    # distance to size on, so risk_amount is not fiction.
+    try:
+        plan = plan_stops(entry_premium, spot, atr, is_call=(direction == "CE"))
+    except ValueError as e:
+        print(f"[{now_str}] Could not plan stops: {e}")
+        return None
+
+    d = rm.size_trade(strategy_name="nifty_options_indicator",
+                      entry_price=entry_premium,
+                      stop_loss_price=plan.premium_stop_for_sizing,
+                      lot_size=LOT_SIZE, symbol=symbol, direction="BUY")
+    if not d["approved"]:
+        print(f"[{now_str}] Passed structure but risk layer blocked: {d['reason']}")
+        return None
+
+    trade_id = rm.record_open(
+        strategy_name="nifty_options_indicator", symbol=symbol, direction="BUY",
+        entry_price=entry_premium, stop_loss_price=plan.premium_stop_for_sizing,
+        quantity=d["quantity"], reservation_id=d["reservation_id"])
+
+    pos = Position(position_id=trade_id, symbol=symbol,
+                   side=Side.LONG_CE if direction == "CE" else Side.LONG_PE,
+                   entry_time=datetime.now(IST), entry_underlying=spot,
+                   entry_premium=entry_premium, quantity=d["quantity"],
+                   atr_at_entry=atr)
+
+    # MUST run before the first evaluate(): it freezes initial_sl_underlying,
+    # which is what defines 1R for the whole life of the trade. Without it
+    # exit_manager raises on risk_points and the position cannot be managed.
+    exit_mgr.set_initial_stop(pos)
+
+    print(f"[{now_str}] PAPER ENTRY: {direction} {symbol} @ Rs.{entry_premium:.2f} "
+          f"qty={d['quantity']} risk=Rs.{d['risk_amount']:.0f} | stop binds on "
+          f"{plan.binding_constraint} (underlying {plan.underlying_stop:.0f} / "
+          f"premium {plan.premium_stop_for_sizing:.2f})")
+
+    return {"trade_id": trade_id, "symbol": symbol, "token": token,
+            "direction": direction, "entry_premium": entry_premium,
+            "sl_premium": plan.premium_stop_for_sizing, "position": pos,
+            "opened_at": pos.entry_time.isoformat()}
+
+
 def find_token_for_symbol(instruments, tradingsymbol):
     """Look a contract's token back up from its trading symbol. Needed when
     recovering a position from state, since the risk module stores the symbol
@@ -249,6 +357,25 @@ def is_stale_position(open_trade):
     return opened.astimezone(IST).date() < datetime.now(IST).date()
 
 
+def _futures_volume(structure):
+    """Current and average futures volume for the momentum score.
+
+    The index itself has no traded volume — only its constituent stocks do —
+    so the collector's futures volume is the correct input here. Passing index
+    volume (always 0) pins the score's volume component at a neutral 0.5 and
+    compresses the usable range, which is what disabled the momentum exit."""
+    day = datetime.now(IST).strftime("%Y-%m-%d")
+    path = DATA_DIR / "NIFTY" / f"summary_{day}.csv"
+    try:
+        df = pd.read_csv(path)
+        vols = pd.to_numeric(df["fut_volume"], errors="coerce").dropna()
+        if vols.empty:
+            return 0.0, 0.0
+        return float(vols.iloc[-1]), float(vols.mean())
+    except Exception:
+        return 0.0, 0.0
+
+
 def run_trading_session(obj, instruments, rm):
     """Runs the intraday trading loop for one session (one market day),
     until the market closes or a fatal error occurs. Returns normally when
@@ -256,6 +383,13 @@ def run_trading_session(obj, instruments, rm):
     NIFTY_TOKEN = "99926000"
     confirmer = RegimeConfirmer()
     prev_regime = "FLAT"
+    signal_eng = SignalEngine()
+    exit_mgr = ExitManager()
+
+    # Guard against the two configs drifting apart. If they disagree, the
+    # reserved risk stops matching the stop that actually fires — the exact
+    # failure entry_sizing exists to prevent, so fail loudly rather than trade.
+    SizingConfig().verify_against_exit_config(exit_mgr.cfg)
 
     # Pick up anything left open by a previous run rather than abandoning it.
     open_trade = recover_open_position(rm, instruments)
@@ -288,69 +422,70 @@ def run_trading_session(obj, instruments, rm):
         spot = last_row["close"]
         now_str = datetime.now(IST).strftime("%H:%M:%S")
 
-        # --- manage open paper trade ---
+        # --- manage open paper trade via ExitManager ---
         if open_trade is not None:
             try:
-                current_premium = get_ltp(obj, "NFO", open_trade["symbol"], open_trade["token"])
+                current_premium = get_ltp(obj, "NFO", open_trade["symbol"],
+                                          open_trade["token"])
             except Exception as e:
                 print(f"[{now_str}] Could not fetch LTP for open position: {e}")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            hit_sl = current_premium <= open_trade["sl_premium"]
-            hit_target = current_premium >= open_trade["target_premium"]
-            near_close = datetime.now(IST).time() >= dtime(15, 20)
+            # Feed FUTURES volume, not index volume. An index has no traded
+            # volume of its own (only its constituents do), so passing index
+            # volume pins the momentum score's volume component at a neutral
+            # 0.5 and compresses the whole score into roughly [0.10, 0.80] —
+            # which makes the momentum-decay exit essentially unreachable.
+            structure, _ = load_structure("NIFTY")
+            fut_vol = avg_fut_vol = 0.0
+            if structure is not None:
+                fut_vol, avg_fut_vol = _futures_volume(structure)
 
-            print(f"[{now_str}] Open {open_trade['direction']} {open_trade['symbol']}: "
-                  f"premium={current_premium:.2f} (entry={open_trade['entry_premium']:.2f}, "
-                  f"SL={open_trade['sl_premium']:.2f}, target={open_trade['target_premium']:.2f})")
+            m = MarketState(
+                timestamp=datetime.now(IST), underlying=spot,
+                premium=current_premium, atr=float(last_row["atr14"]),
+                ema_fast=float(last_row["ema9"]), ema_slow=float(last_row["ema21"]),
+                rsi=float(last_row["rsi14"]), adx=float(last_row["adx14"]),
+                prev_adx=float(df.iloc[-2]["adx14"]) if len(df) > 1 else float(last_row["adx14"]),
+                volume=fut_vol, avg_volume=avg_fut_vol,
+                ema_fast_prev=float(df.iloc[-2]["ema9"]) if len(df) > 1 else float(last_row["ema9"]),
+            )
 
-            if hit_sl or hit_target or near_close:
+            dec = exit_mgr.evaluate(open_trade["position"], m)
+            print(f"[{now_str}] {open_trade['direction']} {open_trade['symbol']}: "
+                  f"premium={current_premium:.2f} R={dec.r_multiple:+.2f} "
+                  f"mom={dec.momentum.value}({dec.momentum_score:.2f}) "
+                  f"-> {dec.action.value}: {dec.reason}")
+
+            if dec.action is Action.EXIT_FULL:
                 pnl = rm.record_close(open_trade["trade_id"], current_premium)
-                reason = "SL" if hit_sl else ("TARGET" if hit_target else "EOD")
-                print(f"[{now_str}] CLOSED ({reason}): P&L = Rs.{pnl:,.2f}")
+                print(f"[{now_str}] CLOSED: P&L = Rs.{pnl:,.2f} ({dec.reason})")
                 open_trade = None
+
+            elif dec.action is Action.EXIT_PARTIAL:
+                # exit_manager has ALREADY updated remaining_quantity,
+                # partial_booked and sl_underlying on the Position before
+                # returning. Do NOT repeat those mutations here — doing so
+                # decrements the size twice and the position tracking collapses
+                # after the first partial book. Only mirror the fill into the
+                # risk module.
+                qty = dec.exit_quantity
+                if qty and qty > 0:
+                    pnl = rm.record_close(open_trade["trade_id"], current_premium,
+                                          quantity=qty)
+                    print(f"[{now_str}] PARTIAL BOOK {qty} units: Rs.{pnl:,.2f} "
+                          f"(remaining {open_trade['position'].remaining_quantity})")
+
+            elif dec.action is Action.UPDATE_SL:
+                # sl_underlying is likewise already set by exit_manager;
+                # nothing to mirror into the risk module for a stop move.
+                pass
 
         # --- look for new entry ---
         elif regime != "FLAT" and regime != prev_regime:
-            direction = "CE" if regime == "UP" else "PE"
-            strike = round_to_strike(spot)
-            try:
-                symbol, token = find_option_contract(instruments, "NIFTY", strike, direction)
-                entry_premium = get_ltp(obj, "NFO", symbol, token)
-            except Exception as e:
-                print(f"[{now_str}] Could not get option contract/price: {e}")
-                prev_regime = regime
-                time.sleep(POLL_SECONDS)
-                continue
-
-            sl_distance = last_row["atr14"] * 1.0 * 0.5  # delta-adjusted for SL only
-            target_distance = last_row["atr14"] * 1.5 * 0.5
-            sl_premium = max(1.0, entry_premium - sl_distance)
-            target_premium = entry_premium + target_distance
-
-            decision = rm.size_trade(
-                strategy_name="nifty_options_indicator",
-                entry_price=entry_premium, stop_loss_price=sl_premium,
-                lot_size=LOT_SIZE, symbol=symbol, direction="BUY",
-            )
-
-            if decision["approved"]:
-                trade_id = rm.record_open(
-                    strategy_name="nifty_options_indicator", symbol=symbol,
-                    direction="BUY", entry_price=entry_premium,
-                    stop_loss_price=sl_premium, quantity=decision["quantity"],
-                    reservation_id=decision["reservation_id"],
-                )
-                open_trade = {
-                    "trade_id": trade_id, "symbol": symbol, "token": token,
-                    "direction": direction, "entry_premium": entry_premium,
-                    "sl_premium": sl_premium, "target_premium": target_premium,
-                }
-                print(f"[{now_str}] PAPER ENTRY: {direction} {symbol} @ Rs.{entry_premium:.2f} "
-                      f"(qty={decision['quantity']}, risk=Rs.{decision['risk_amount']:.0f})")
-            else:
-                print(f"[{now_str}] Signal fired but blocked: {decision['reason']}")
+            open_trade = open_new_trade(obj, instruments, rm, signal_eng,
+                                        exit_mgr, last_row, spot, regime, now_str)
 
         prev_regime = regime
         time.sleep(POLL_SECONDS)
