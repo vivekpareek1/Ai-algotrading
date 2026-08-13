@@ -165,6 +165,90 @@ def get_recent_candles(obj, token, exchange="NSE", interval="FIFTEEN_MINUTE", da
     return df
 
 
+def find_token_for_symbol(instruments, tradingsymbol):
+    """Look a contract's token back up from its trading symbol. Needed when
+    recovering a position from state, since the risk module stores the symbol
+    but not the token."""
+    for inst in instruments:
+        if inst.get("symbol") == tradingsymbol:
+            return inst.get("token")
+    return None
+
+
+def recover_open_position(rm, instruments, strategy_name="nifty_options_indicator"):
+    """
+    Rebuild in-memory tracking for a position that is already open in the risk
+    module's state.
+
+    WHY THIS EXISTS: open_trade used to be a plain local variable, reset to None
+    at the top of every session. Any position open when the process stopped — a
+    crash, a restart, Ctrl+C, or simply the end of the day — stayed recorded in
+    the state file while the engine forgot about it entirely. Nothing then
+    monitored it, nothing closed it, and its reserved risk and deployed capital
+    stayed permanently consumed. Recovering here is what makes the daemon
+    genuinely restart-safe rather than only appearing to be.
+
+    Returns an open_trade dict, or None if there is nothing to recover.
+    """
+    positions = rm.list_open_positions()
+    mine = {tid: p for tid, p in positions.items()
+            if p.get("strategy") == strategy_name}
+
+    if not mine:
+        return None
+
+    if len(mine) > 1:
+        print(f"WARNING: {len(mine)} open positions found for {strategy_name}, "
+              f"but this engine only tracks one at a time. Recovering the most "
+              f"recent; the others need closing manually from the dashboard.")
+
+    trade_id = max(mine, key=lambda t: mine[t].get("opened_at", ""))
+    pos = mine[trade_id]
+
+    token = find_token_for_symbol(instruments, pos["symbol"])
+    if token is None:
+        print(f"WARNING: recovered position {trade_id} ({pos['symbol']}) but its "
+              f"contract is not in the current instrument master — it has most "
+              f"likely expired. It cannot be priced or closed automatically. "
+              f"Close it manually from the dashboard to free its reserved risk.")
+        return None
+
+    entry_premium = float(pos["entry_price"])
+    sl_premium = float(pos["stop_loss_price"])
+    # Target is not stored in state; reconstruct it from the same 1.5:1 ratio
+    # the entry logic uses, so a recovered trade exits on the same terms.
+    target_premium = entry_premium + (entry_premium - sl_premium) * 1.5
+
+    direction = "CE" if pos["symbol"].endswith("CE") else "PE"
+
+    print(f"RECOVERED open position {trade_id}: {pos['symbol']} "
+          f"entry Rs.{entry_premium:.2f}, SL Rs.{sl_premium:.2f}, "
+          f"opened {pos.get('opened_at', 'unknown')}")
+
+    return {
+        "trade_id": trade_id, "symbol": pos["symbol"], "token": token,
+        "direction": direction, "entry_premium": entry_premium,
+        "sl_premium": sl_premium, "target_premium": target_premium,
+        "opened_at": pos.get("opened_at", ""),
+    }
+
+
+def is_stale_position(open_trade):
+    """True if the position was opened on an earlier day. These are intraday
+    option trades — nothing should ever carry overnight, so a position from a
+    previous session means the square-off never ran and it must be closed at
+    the first opportunity rather than treated as a live trade."""
+    if not open_trade or not open_trade.get("opened_at"):
+        return False
+    try:
+        opened = datetime.fromisoformat(open_trade["opened_at"])
+    except (ValueError, TypeError):
+        return False
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=IST)
+    return opened.astimezone(IST).date() < datetime.now(IST).date()
+
+
 def run_trading_session(obj, instruments, rm):
     """Runs the intraday trading loop for one session (one market day),
     until the market closes or a fatal error occurs. Returns normally when
@@ -172,7 +256,22 @@ def run_trading_session(obj, instruments, rm):
     NIFTY_TOKEN = "99926000"
     confirmer = RegimeConfirmer()
     prev_regime = "FLAT"
-    open_trade = None
+
+    # Pick up anything left open by a previous run rather than abandoning it.
+    open_trade = recover_open_position(rm, instruments)
+
+    if open_trade and is_stale_position(open_trade):
+        print(f"Position {open_trade['trade_id']} is from a previous day — "
+              f"squaring off now at market price (intraday strategy, nothing "
+              f"should carry overnight).")
+        try:
+            px = get_ltp(obj, "NFO", open_trade["symbol"], open_trade["token"])
+            pnl = rm.record_close(open_trade["trade_id"], px)
+            print(f"Stale position closed at Rs.{px:.2f}, P&L Rs.{pnl:,.2f}")
+        except Exception as e:
+            print(f"Could not close stale position automatically: {e}. "
+                  f"Close it from the dashboard to free its reserved risk.")
+        open_trade = None
 
     while is_market_open():
         df = get_recent_candles(obj, NIFTY_TOKEN)
