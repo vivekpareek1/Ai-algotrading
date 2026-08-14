@@ -34,6 +34,7 @@ from risk_manager import RiskManager
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 JOURNAL_PATH = Path(__file__).parent / "trade_journal.csv"
+DATA_DIR = Path(__file__).parent / "data"
 PORT = 8080
 
 
@@ -41,6 +42,42 @@ def get_dashboard_password():
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
     return cfg.get("dashboard_password", "changeme")
+
+
+def get_price_series(underlying, limit=200):
+    """
+    Reads the day's spot-price snapshots from oi_collector's summary CSV
+    (or gold_price_collector's, for GOLD) and returns
+    [{"time": "...", "price": float}] for charting.
+
+    Uses only the stdlib csv module — same reasoning as get_equity_curve():
+    the dashboard process has no pandas dependency and doesn't need one just
+    for this.
+
+    Deliberately reads collector OUTPUT files only — never calls Angel One
+    itself. The dashboard must never become a second source of API traffic
+    on top of the collectors, especially with today's rate-limit incident
+    still active.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    path = DATA_DIR / underlying / f"summary_{today}.csv"
+    if not path.exists():
+        return []
+
+    rows = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            price_raw = row.get("spot") or row.get("ltp") or row.get("price")
+            if not price_raw:
+                continue
+            try:
+                price = float(price_raw)
+            except ValueError:
+                continue
+            rows.append({"time": row.get("timestamp", ""), "price": round(price, 2)})
+
+    rows.sort(key=lambda r: r["time"])
+    return rows[-limit:]
 
 
 def get_equity_curve(limit=200):
@@ -221,6 +258,10 @@ def render_page(rm: RiskManager) -> str:
   #chartWrap {{ background: #1e293b; border-radius: 10px; padding: 16px;
                border: 1px solid #334155; }}
   #equityChart {{ width: 100%; height: 220px; display: block; }}
+  .price-chart-wrap {{ background: #1e293b; border-radius: 10px; padding: 16px;
+                       border: 1px solid #334155; }}
+  .price-chart-wrap canvas {{ width: 100%; height: 180px; display: block; }}
+  .chart-empty-msg {{ color: #888; text-align: center; padding: 40px 0; }}
 </style>
 </head>
 <body>
@@ -246,6 +287,26 @@ def render_page(rm: RiskManager) -> str:
     <div class="card"><div class="label">Max Daily Loss</div><div class="value">Rs.{status['max_daily_loss_amount']:,.0f}</div></div>
     <div class="card"><div class="label">Capital Deployed</div><div class="value">Rs.{status['capital_deployed']:,.0f}</div></div>
   </div>
+
+  <section>
+    <h2>Nifty Index — today's price</h2>
+    <div id="niftyChartWrap" class="price-chart-wrap">
+      <canvas id="niftyChart" width="960" height="180"></canvas>
+      <div id="niftyChartEmpty" class="chart-empty-msg" style="display:none;">
+        No Nifty price data yet today — the oi-collector service fills this in.
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>MCX Gold — today's price</h2>
+    <div id="goldChartWrap" class="price-chart-wrap">
+      <canvas id="goldChart" width="960" height="180"></canvas>
+      <div id="goldChartEmpty" class="chart-empty-msg" style="display:none;">
+        No Gold price data yet today — the gold-price-collector service fills this in.
+      </div>
+    </div>
+  </section>
 
   <section>
     <h2>Equity Curve — cumulative P&amp;L from closed trades</h2>
@@ -389,6 +450,83 @@ fetch('/api/equity-curve')
     document.getElementById('chartEmpty').style.display = 'block';
     document.getElementById('chartEmpty').textContent = 'Could not load chart data.';
   }});
+
+function drawPriceChart(canvasId, emptyId, data, lineColor) {{
+  const canvas = document.getElementById(canvasId);
+  const emptyMsg = document.getElementById(emptyId);
+
+  if (!data || data.length === 0) {{
+    canvas.style.display = 'none';
+    emptyMsg.style.display = 'block';
+    return;
+  }}
+  canvas.style.display = 'block';
+  emptyMsg.style.display = 'none';
+
+  const dpr = window.devicePixelRatio || 1;
+  const cssWidth = canvas.clientWidth || 960;
+  const cssHeight = 180;
+  canvas.width = cssWidth * dpr;
+  canvas.height = cssHeight * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+  const padL = 70, padR = 16, padT = 16, padB = 24;
+  const plotW = cssWidth - padL - padR;
+  const plotH = cssHeight - padT - padB;
+
+  const values = data.map(d => d.price);
+  let min = Math.min(...values), max = Math.max(...values);
+  if (min === max) {{ min -= 1; max += 1; }}   // flat/single-point series: avoid a zero-height plot
+  const pad = (max - min) * 0.08;
+  min -= pad; max += pad;
+
+  const xFor = i => padL + (data.length === 1 ? plotW / 2 : (i / (data.length - 1)) * plotW);
+  const yFor = v => padT + plotH - ((v - min) / (max - min)) * plotH;
+
+  ctx.fillStyle = '#64748b';
+  ctx.font = '11px monospace';
+  ctx.fillText(Math.round(max).toLocaleString(), 4, padT + 8);
+  ctx.fillText(Math.round(min).toLocaleString(), 4, padT + plotH);
+
+  ctx.strokeStyle = lineColor;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  data.forEach((d, i) => {{
+    const x = xFor(i), y = yFor(d.price);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }});
+  ctx.stroke();
+
+  const lastX = xFor(data.length - 1), lastY = yFor(values[values.length - 1]);
+  ctx.fillStyle = lineColor;
+  ctx.beginPath();
+  ctx.arc(lastX, lastY, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.font = '12px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText(values[values.length - 1].toLocaleString(), lastX - 8, lastY - 8);
+  ctx.textAlign = 'left';
+}}
+
+fetch('/api/nifty-price')
+  .then(r => r.json())
+  .then(d => drawPriceChart('niftyChart', 'niftyChartEmpty', d, '#38bdf8'))
+  .catch(() => {{
+    document.getElementById('niftyChart').style.display = 'none';
+    document.getElementById('niftyChartEmpty').style.display = 'block';
+    document.getElementById('niftyChartEmpty').textContent = 'Could not load Nifty price data.';
+  }});
+
+fetch('/api/gold-price')
+  .then(r => r.json())
+  .then(d => drawPriceChart('goldChart', 'goldChartEmpty', d, '#eab308'))
+  .catch(() => {{
+    document.getElementById('goldChart').style.display = 'none';
+    document.getElementById('goldChartEmpty').style.display = 'block';
+    document.getElementById('goldChartEmpty').textContent = 'Could not load Gold price data.';
+  }});
 </script>
 </body>
 </html>"""
@@ -428,6 +566,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             elif self.path == "/api/equity-curve":
                 body = json.dumps(get_equity_curve(), indent=2).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/api/nifty-price":
+                body = json.dumps(get_price_series("NIFTY"), indent=2).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/api/gold-price":
+                body = json.dumps(get_price_series("GOLD"), indent=2).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
