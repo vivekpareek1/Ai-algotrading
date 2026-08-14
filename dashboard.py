@@ -311,25 +311,25 @@ def render_page(rm: RiskManager) -> str:
 <body>
 <div class="container">
   <h1>Trading Risk Dashboard</h1>
-  <div class="subtitle">Trading day: {status['trading_day']} &nbsp;|&nbsp; Auto-refreshes every 5s &nbsp;|&nbsp; Last updated: {datetime.now().strftime('%H:%M:%S')}</div>
+  <div class="subtitle">Trading day: {status['trading_day']} &nbsp;|&nbsp; Live — updates every 5s, no reload &nbsp;|&nbsp; Last updated: <span id="lastUpdated">{datetime.now().strftime('%H:%M:%S')}</span></div>
 
-  <span class="badge">{badge_text}</span>
-  {f'<div class="reason-box">{status["block_reason"]}</div>' if blocked else ''}
-  {unblock_button}
+  <span class="badge" id="badge" style="background:{badge_color};">{badge_text}</span>
+  <div id="reasonBox">{f'<div class="reason-box">{status["block_reason"]}</div>' if blocked else ''}</div>
+  <div id="unblockContainer">{unblock_button}</div>
 
-  <div style="margin-top:18px;">
+  <div style="margin-top:18px;" id="engineToggleContainer">
     {engine_toggle}
   </div>
 
   <div class="grid">
-    <div class="card"><div class="label">Total Capital</div><div class="value">Rs.{status['total_capital']:,.0f}</div></div>
-    <div class="card"><div class="label">Realized P&amp;L Today</div><div class="value" style="color:{pnl_color}">Rs.{pnl:,.0f}</div></div>
-    <div class="card"><div class="label">Unrealized P&amp;L</div><div class="value">Rs.{status['unrealized_pnl']:,.0f}</div></div>
-    <div class="card"><div class="label">Open Positions</div><div class="value">{status['open_positions_count']}</div></div>
-    <div class="card"><div class="label">Committed Risk</div><div class="value">Rs.{status['committed_risk']:,.0f}</div></div>
-    <div class="card"><div class="label">Max Open Risk</div><div class="value">Rs.{status['max_open_risk_amount']:,.0f}</div></div>
-    <div class="card"><div class="label">Max Daily Loss</div><div class="value">Rs.{status['max_daily_loss_amount']:,.0f}</div></div>
-    <div class="card"><div class="label">Capital Deployed</div><div class="value">Rs.{status['capital_deployed']:,.0f}</div></div>
+    <div class="card"><div class="label">Total Capital</div><div class="value" id="val-total-capital">Rs.{status['total_capital']:,.0f}</div></div>
+    <div class="card"><div class="label">Realized P&amp;L Today</div><div class="value" id="val-pnl-realized" style="color:{pnl_color}">Rs.{pnl:,.0f}</div></div>
+    <div class="card"><div class="label">Unrealized P&amp;L</div><div class="value" id="val-pnl-unrealized">Rs.{status['unrealized_pnl']:,.0f}</div></div>
+    <div class="card"><div class="label">Open Positions</div><div class="value" id="val-open-positions">{status['open_positions_count']}</div></div>
+    <div class="card"><div class="label">Committed Risk</div><div class="value" id="val-committed-risk">Rs.{status['committed_risk']:,.0f}</div></div>
+    <div class="card"><div class="label">Max Open Risk</div><div class="value" id="val-max-open-risk">Rs.{status['max_open_risk_amount']:,.0f}</div></div>
+    <div class="card"><div class="label">Max Daily Loss</div><div class="value" id="val-max-daily-loss">Rs.{status['max_daily_loss_amount']:,.0f}</div></div>
+    <div class="card"><div class="label">Capital Deployed</div><div class="value" id="val-capital-deployed">Rs.{status['capital_deployed']:,.0f}</div></div>
   </div>
 
   <section>
@@ -379,7 +379,9 @@ def render_page(rm: RiskManager) -> str:
     <table>
       <tr><th>Trade ID</th><th>Strategy</th><th>Symbol</th><th>Dir</th><th>Qty</th>
           <th>Entry</th><th>Stop Loss</th><th>Risk</th></tr>
+      <tbody id="positionsBody">
       {rows}
+      </tbody>
     </table>
   </section>
 
@@ -387,7 +389,9 @@ def render_page(rm: RiskManager) -> str:
     <h2>Capital Used by Strategy</h2>
     <table>
       <tr><th>Strategy</th><th>Capital Deployed</th></tr>
+      <tbody id="capitalBody">
       {strat_rows}
+      </tbody>
     </table>
   </section>
 
@@ -396,7 +400,9 @@ def render_page(rm: RiskManager) -> str:
     <table>
       <tr><th>Time</th><th>Event</th><th>Strategy</th><th>Symbol</th><th>Dir</th>
           <th>Qty</th><th>P&amp;L</th><th>Reason / Note</th></tr>
+      <tbody id="journalBody">
       {journal_rows}
+      </tbody>
     </table>
   </section>
 
@@ -404,17 +410,173 @@ def render_page(rm: RiskManager) -> str:
 </div>
 
 <script>
-setTimeout(() => location.reload(), 5000);
+// Store each chart's latest raw points so a periodic refresh can redraw at
+// whatever timeframe is currently selected, without re-fetching AND without
+// re-attaching click listeners (attaching them again on every refresh would
+// stack duplicate handlers — each click would then fire multiple redraws).
+const chartData = {{ nifty: [], gold: [] }};
+
+function currentStep(chartName) {{
+  const row = document.querySelector('.timeframe-row[data-chart="' + chartName + '"]');
+  const activeBtn = row ? row.querySelector('.tf-btn.active') : null;
+  return activeBtn ? parseInt(activeBtn.dataset.tf, 10) : 3;
+}}
+
+function renderPriceChart(chartName, canvasId, emptyId) {{
+  const points = chartData[chartName] || [];
+  drawCandleChart(canvasId, emptyId, buildCandlesJS(points, currentStep(chartName)));
+}}
+
+function setupPriceChart(apiPath, canvasId, emptyId, chartName) {{
+  // ONE-TIME setup: attaches the timeframe button listeners exactly once.
+  const row = document.querySelector('.timeframe-row[data-chart="' + chartName + '"]');
+  if (row) {{
+    row.querySelectorAll('.tf-btn').forEach(btn => {{
+      btn.addEventListener('click', () => {{
+        row.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        renderPriceChart(chartName, canvasId, emptyId);
+      }});
+    }});
+  }}
+  refreshPriceChart(apiPath, canvasId, emptyId, chartName);
+}}
+
+function refreshPriceChart(apiPath, canvasId, emptyId, chartName) {{
+  // Safe to call repeatedly on an interval: only fetches + redraws, never
+  // touches event listeners.
+  fetch(apiPath)
+    .then(r => r.json())
+    .then(points => {{
+      chartData[chartName] = points;
+      renderPriceChart(chartName, canvasId, emptyId);
+    }})
+    .catch(() => {{
+      document.getElementById(canvasId).style.display = 'none';
+      document.getElementById(emptyId).style.display = 'block';
+      document.getElementById(emptyId).textContent = 'Could not load ' + chartName + ' price data.';
+    }});
+}}
+
+const EVENT_COLORS = {{
+  APPROVED: '#16a34a', OPENED: '#16a34a', CLOSED: '#3b82f6',
+  BLOCKED: '#dc2626', KILL_SWITCH: '#dc2626',
+  RESERVATION_EXPIRED: '#f59e0b', RESERVATION_CANCELLED: '#f59e0b',
+  MANUAL_UNBLOCK: '#a855f7', ENGINE_ACTIVATED: '#16a34a',
+  ENGINE_DEACTIVATED: '#64748b',
+}};
+
+function fmtRs0(n) {{ return 'Rs.' + Math.round(Number(n) || 0).toLocaleString(); }}
+function fmtRs2(n) {{
+  const v = Number(n);
+  return 'Rs.' + (isNaN(v) ? '0.00' : v.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}}));
+}}
+function esc(s) {{
+  const d = document.createElement('div');
+  d.textContent = (s === undefined || s === null) ? '' : String(s);
+  return d.innerHTML;
+}}
+
+function refreshDashboard() {{
+  fetch('/api/full-state')
+    .then(r => r.json())
+    .then(state => {{
+      const status = state.status, positions = state.positions, journal = state.journal;
+
+      document.getElementById('lastUpdated').textContent =
+        new Date().toLocaleTimeString([], {{hour12: false}});
+
+      const engineOn = status.engine_active, killBlocked = status.blocked_for_today;
+      let badgeColor, badgeText;
+      if (!engineOn) {{ badgeColor = '#64748b'; badgeText = 'ENGINE OFF'; }}
+      else if (killBlocked) {{ badgeColor = '#dc2626'; badgeText = 'TRADING BLOCKED (daily loss limit)'; }}
+      else {{ badgeColor = '#16a34a'; badgeText = 'ENGINE ON — TRADING ACTIVE'; }}
+      const badge = document.getElementById('badge');
+      badge.textContent = badgeText;
+      badge.style.background = badgeColor;
+
+      document.getElementById('reasonBox').innerHTML = killBlocked
+        ? '<div class="reason-box" style="border-left-color:' + badgeColor + '">' + esc(status.block_reason) + '</div>'
+        : '';
+
+      document.getElementById('unblockContainer').innerHTML = killBlocked
+        ? '<button onclick="unblock()" style="background:#dc2626;color:white;border:none;' +
+          'padding:10px 20px;border-radius:6px;cursor:pointer;font-size:14px;margin-top:10px;">' +
+          'Manually Unblock Trading</button>' +
+          '<p style="color:#888;font-size:12px;">Only override this if you understand why the ' +
+          'limit fired. It exists to protect you.</p>'
+        : '';
+
+      document.getElementById('engineToggleContainer').innerHTML = engineOn
+        ? '<button onclick="toggleEngine(\\'off\\')" style="background:#dc2626;color:white;border:none;' +
+          'padding:12px 24px;border-radius:6px;cursor:pointer;font-size:15px;font-weight:600;">' +
+          'Turn Engine OFF</button>'
+        : '<button onclick="toggleEngine(\\'on\\')" style="background:#16a34a;color:white;border:none;' +
+          'padding:12px 24px;border-radius:6px;cursor:pointer;font-size:15px;font-weight:600;">' +
+          'Turn Engine ON</button>' +
+          '<p style="color:#888;font-size:12px;margin-top:8px;">No trades are approved while the ' +
+          'engine is off, no matter what your strategies signal.</p>';
+
+      const pnl = Number(status.realized_pnl_today) || 0;
+      document.getElementById('val-total-capital').textContent = fmtRs0(status.total_capital);
+      const pnlEl = document.getElementById('val-pnl-realized');
+      pnlEl.textContent = fmtRs0(pnl);
+      pnlEl.style.color = pnl >= 0 ? '#16a34a' : '#dc2626';
+      document.getElementById('val-pnl-unrealized').textContent = fmtRs0(status.unrealized_pnl);
+      document.getElementById('val-open-positions').textContent = status.open_positions_count;
+      document.getElementById('val-committed-risk').textContent = fmtRs0(status.committed_risk);
+      document.getElementById('val-max-open-risk').textContent = fmtRs0(status.max_open_risk_amount);
+      document.getElementById('val-max-daily-loss').textContent = fmtRs0(status.max_daily_loss_amount);
+      document.getElementById('val-capital-deployed').textContent = fmtRs0(status.capital_deployed);
+
+      const posBody = document.getElementById('positionsBody');
+      const posEntries = Object.entries(positions || {{}});
+      posBody.innerHTML = posEntries.length === 0
+        ? '<tr><td colspan="8" style="text-align:center;color:#888;">No open positions</td></tr>'
+        : posEntries.map(([tid, p]) =>
+            '<tr><td>' + esc(tid) + '</td><td>' + esc(p.strategy) + '</td><td>' + esc(p.symbol) +
+            '</td><td>' + esc(p.direction) + '</td><td>' + esc(p.quantity) + '</td><td>' +
+            fmtRs2(p.entry_price) + '</td><td>' + fmtRs2(p.stop_loss_price) + '</td><td>' +
+            fmtRs0(p.risk_amount) + '</td></tr>'
+          ).join('');
+
+      document.getElementById('capitalBody').innerHTML =
+        Object.entries(status.capital_by_strategy || {{}})
+          .map(([name, used]) => '<tr><td>' + esc(name) + '</td><td>' + fmtRs0(used) + '</td></tr>')
+          .join('');
+
+      const jBody = document.getElementById('journalBody');
+      jBody.innerHTML = (!journal || journal.length === 0)
+        ? '<tr><td colspan="8" style="text-align:center;color:#888;">No activity yet</td></tr>'
+        : journal.map(row => {{
+            const color = EVENT_COLORS[row.event] || '#94a3b8';
+            const ts = String(row.timestamp || '').slice(0, 19).replace('T', ' ');
+            let pnlHtml = '';
+            if (row.pnl) {{
+              const pnlF = parseFloat(row.pnl);
+              if (!isNaN(pnlF)) {{
+                pnlHtml = '<span style="color:' + (pnlF >= 0 ? '#16a34a' : '#dc2626') + '">' + fmtRs0(pnlF) + '</span>';
+              }}
+            }}
+            return '<tr><td>' + esc(ts) + '</td><td><span style="color:' + color + ';font-weight:600;">' +
+              esc(row.event) + '</span></td><td>' + esc(row.strategy) + '</td><td>' + esc(row.symbol) +
+              '</td><td>' + esc(row.direction) + '</td><td>' + esc(row.quantity) + '</td><td>' + pnlHtml +
+              '</td><td style="color:#94a3b8;font-size:12px;max-width:280px;">' + esc(row.reason) + '</td></tr>';
+          }}).join('');
+    }})
+    .catch(err => console.error('Dashboard refresh failed:', err));
+}}
+
 function unblock() {{
   if (!confirm("Are you sure you want to unblock trading? Only do this if you understand why the daily loss limit fired.")) return;
-  fetch('/api/unblock', {{method: 'POST'}}).then(() => location.reload());
+  fetch('/api/unblock', {{method: 'POST'}}).then(refreshDashboard);
 }}
 function toggleEngine(state) {{
   const msg = state === 'on'
     ? "Turn the engine ON? Strategies will be able to place real trades from now on."
     : "Turn the engine OFF? No new trades will be approved until you turn it back on.";
   if (!confirm(msg)) return;
-  fetch('/api/engine/' + state, {{method: 'POST'}}).then(() => location.reload());
+  fetch('/api/engine/' + state, {{method: 'POST'}}).then(refreshDashboard);
 }}
 
 function drawEquityChart(data) {{
@@ -616,36 +778,19 @@ function drawCandleChart(canvasId, emptyId, candles) {{
   ctx.textAlign = 'left';
 }}
 
-function setupPriceChart(apiPath, canvasId, emptyId, chartName) {{
-  fetch(apiPath)
-    .then(r => r.json())
-    .then(points => {{
-      const row = document.querySelector('.timeframe-row[data-chart="' + chartName + '"]');
-      const render = step => drawCandleChart(canvasId, emptyId, buildCandlesJS(points, step));
-
-      // default view matches whichever button already has .active in the HTML
-      const activeBtn = row ? row.querySelector('.tf-btn.active') : null;
-      render(activeBtn ? parseInt(activeBtn.dataset.tf, 10) : 3);
-
-      if (row) {{
-        row.querySelectorAll('.tf-btn').forEach(btn => {{
-          btn.addEventListener('click', () => {{
-            row.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            render(parseInt(btn.dataset.tf, 10));
-          }});
-        }});
-      }}
-    }})
-    .catch(() => {{
-      document.getElementById(canvasId).style.display = 'none';
-      document.getElementById(emptyId).style.display = 'block';
-      document.getElementById(emptyId).textContent = 'Could not load ' + chartName + ' price data.';
-    }});
-}}
-
 setupPriceChart('/api/nifty-price', 'niftyChart', 'niftyChartEmpty', 'nifty');
 setupPriceChart('/api/gold-price', 'goldChart', 'goldChartEmpty', 'gold');
+
+// Live updates, no page reload: stats/tables every 5s, charts every 15s
+// (chart data only changes every 5 min at the source, so 15s is already
+// far more often than needed — this just needs to feel responsive, not
+// hammer the endpoints for no reason).
+setInterval(refreshDashboard, 5000);
+setInterval(() => {{
+  refreshPriceChart('/api/nifty-price', 'niftyChart', 'niftyChartEmpty', 'nifty');
+  refreshPriceChart('/api/gold-price', 'goldChart', 'goldChartEmpty', 'gold');
+  fetch('/api/equity-curve').then(r => r.json()).then(drawEquityChart).catch(() => {{}});
+}}, 15000);
 </script>
 </body>
 </html>"""
@@ -699,6 +844,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             elif self.path == "/api/gold-price":
                 body = json.dumps(get_price_series("GOLD"), indent=2).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/api/full-state":
+                # everything the live-updating dashboard needs, in one call —
+                # replaces the old full-page reload with in-place DOM updates
+                state = {
+                    "status": rm.get_status(),
+                    "positions": rm.list_open_positions(),
+                    "journal": rm.list_recent_journal(limit=100),
+                }
+                body = json.dumps(state, indent=2, default=str).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
