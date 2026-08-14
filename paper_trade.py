@@ -43,6 +43,7 @@ import pandas as pd
 import pyotp
 import logzero
 from SmartApi import SmartConnect
+from SmartApi.smartExceptions import TokenException
 
 logzero.loglevel(logging.CRITICAL)  # same credential-leak protection as fetch_historical_data.py
 
@@ -499,10 +500,36 @@ def run_trading_session(obj, instruments, rm):
               f"tomorrow — check the dashboard.")
 
 
+def is_rate_limit_error(exc):
+    """Angel One's rate limiter returns plain text instead of JSON, which
+    surfaces through this library as a generic parse-failure exception with
+    no distinct type — string matching on the message is the only way to
+    tell it apart from a real connectivity or auth failure."""
+    msg = str(exc).lower()
+    return "exceeding access rate" in msg or "access denied" in msg
+
+
 def main():
     """Runs forever as a background service: waits for market hours, trades
     through the session, then waits for the next trading day. Designed to
-    run under systemd with Restart=always, so it survives crashes too."""
+    run under systemd with Restart=always, so it survives crashes too.
+
+    SESSION REUSE + BACKOFF — fixed after a real incident: the previous
+    version called login() at the top of every retry, and retried every
+    session-ending exception on a flat 60-second timer. Angel One sessions
+    are valid for the whole trading day, so re-logging in on every retry was
+    pure waste — and worse, when something failed immediately at the start of
+    every session (as happened live), that waste became a login roughly once
+    a minute for four straight hours. Angel's rate limiter is well documented
+    to fire even under normal usage and to stay tripped for a while once it
+    does — hammering it every 60 seconds during that window made the outage
+    longer, not shorter.
+
+    Now: log in once per day and reuse the session across retries. On a
+    rate-limit error specifically, back off for minutes, not seconds, and
+    let the wait grow on repeated hits instead of retrying at a fixed
+    interval forever.
+    """
     print("=" * 60)
     print("PAPER TRADING ENGINE (24/7 daemon) — no real orders will be placed")
     print("=" * 60)
@@ -511,20 +538,31 @@ def main():
     if not rm.is_engine_active():
         rm.activate_engine(reason="paper_trade.py session")
 
+    obj = None
     instruments = None
+    last_login_day = None
     last_instrument_refresh_day = None
+    consecutive_rate_limit_hits = 0
+
+    RATE_LIMIT_BACKOFF_BASE = 300     # 5 min — Angel's limiter needs real time, not seconds
+    RATE_LIMIT_BACKOFF_CAP = 1800     # never wait more than 30 min before trying again
+    NORMAL_ERROR_BACKOFF = 60         # non-rate-limit errors (network blip etc) can retry sooner
 
     while True:
         if not is_market_open():
             now = datetime.now(IST)
             print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Market closed. "
                   f"Waiting... (checks every 5 min)")
+            obj = None  # force a fresh login when the market reopens
             time.sleep(300)
             continue
 
         today = datetime.now(IST).date()
         try:
-            obj = login()
+            if obj is None or last_login_day != today:
+                obj = login()
+                last_login_day = today
+
             if instruments is None or last_instrument_refresh_day != today:
                 instruments = load_instrument_master()
                 last_instrument_refresh_day = today
@@ -534,13 +572,35 @@ def main():
             run_trading_session(obj, instruments, rm)
             print(f"\n[{datetime.now(IST).strftime('%H:%M:%S')}] "
                   f"Session ended (market closed for today).")
+            consecutive_rate_limit_hits = 0   # a clean session resets the backoff
+
+        except TokenException as e:
+            # the one case that genuinely means "the session is dead" —
+            # always force a fresh login for this specific failure
+            print(f"ERROR: session/token invalid ({e}). Forcing re-login.")
+            obj = None
+            time.sleep(NORMAL_ERROR_BACKOFF)
 
         except Exception as e:
-            # don't let one bad error kill the whole daemon — log it,
-            # wait a bit, and let the outer loop retry
             print(f"ERROR in trading session: {e}")
-            print("Waiting 60s before retrying...")
-            time.sleep(60)
+
+            if is_rate_limit_error(e):
+                consecutive_rate_limit_hits += 1
+                wait = min(RATE_LIMIT_BACKOFF_BASE * (2 ** (consecutive_rate_limit_hits - 1)),
+                          RATE_LIMIT_BACKOFF_CAP)
+                print(f"Angel One rate limit hit (#{consecutive_rate_limit_hits} in a row). "
+                      f"Backing off {wait//60} min before retrying — repeatedly "
+                      f"retrying quickly is what caused this in the first place.")
+                # Deliberately NOT forcing re-login here. The live incident
+                # showed login succeeding every time; the failure was the very
+                # next call. Re-logging in anyway would add an extra API call
+                # during the exact window we are trying to reduce calls in,
+                # and could itself be what pushes a combined per-client limit
+                # over the edge. The existing session is reused for the retry.
+                time.sleep(wait)
+            else:
+                print(f"Waiting {NORMAL_ERROR_BACKOFF}s before retrying...")
+                time.sleep(NORMAL_ERROR_BACKOFF)
 
 
 if __name__ == "__main__":
