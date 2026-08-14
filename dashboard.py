@@ -80,6 +80,44 @@ def get_price_series(underlying, limit=200):
     return rows[-limit:]
 
 
+def build_candles(price_points, group_size=1):
+    """
+    Turns point-in-time price snapshots into OHLC candles.
+
+    HONEST LIMITATION — read before trusting the high/low: our collectors
+    record a single LTP snapshot every 5 minutes, not continuous tick data.
+    So a candle's open/close are real prices at those two moments, but its
+    high/low are only the max/min of the SAMPLED points in that candle, not
+    the true intra-candle range — real price could have moved further in
+    between samples than what we captured. Getting genuine OHLC would mean
+    calling Angel One's getCandleData API, which is deliberately not done
+    here — that's the same endpoint that's had rate-limit problems, and the
+    dashboard must never be a second source of API traffic on top of the
+    collectors, especially on a page that auto-refreshes every 5 seconds.
+
+    group_size=1 makes each candle span two consecutive 5-min points (so a
+    10-minute candle from real 5-min data): open = the earlier point, close
+    = the later one. group_size=3 would span ~15 minutes per candle, etc. —
+    raise it if the chart looks too noisy at the native interval.
+    """
+    if len(price_points) < 2:
+        return []
+
+    step = max(1, group_size)
+    candles = []
+    for i in range(step, len(price_points), step):
+        window = price_points[i - step:i + 1]
+        prices = [p["price"] for p in window]
+        candles.append({
+            "time": window[-1]["time"],
+            "open": window[0]["price"],
+            "close": window[-1]["price"],
+            "high": max(prices),
+            "low": min(prices),
+        })
+    return candles
+
+
 def get_equity_curve(limit=200):
     """
     Reads CLOSED trades from trade_journal.csv and returns a cumulative P&L
@@ -451,11 +489,11 @@ fetch('/api/equity-curve')
     document.getElementById('chartEmpty').textContent = 'Could not load chart data.';
   }});
 
-function drawPriceChart(canvasId, emptyId, data, lineColor) {{
+function drawCandleChart(canvasId, emptyId, candles) {{
   const canvas = document.getElementById(canvasId);
   const emptyMsg = document.getElementById(emptyId);
 
-  if (!data || data.length === 0) {{
+  if (!candles || candles.length === 0) {{
     canvas.style.display = 'none';
     emptyMsg.style.display = 'block';
     return;
@@ -476,13 +514,17 @@ function drawPriceChart(canvasId, emptyId, data, lineColor) {{
   const plotW = cssWidth - padL - padR;
   const plotH = cssHeight - padT - padB;
 
-  const values = data.map(d => d.price);
-  let min = Math.min(...values), max = Math.max(...values);
-  if (min === max) {{ min -= 1; max += 1; }}   // flat/single-point series: avoid a zero-height plot
+  const highs = candles.map(c => c.high), lows = candles.map(c => c.low);
+  let min = Math.min(...lows), max = Math.max(...highs);
+  if (min === max) {{ min -= 1; max += 1; }}   // flat series: avoid a zero-height plot
   const pad = (max - min) * 0.08;
   min -= pad; max += pad;
 
-  const xFor = i => padL + (data.length === 1 ? plotW / 2 : (i / (data.length - 1)) * plotW);
+  // each candle gets an equal slot; body width is most of that slot, leaving
+  // a visible gap between candles like a normal candlestick chart
+  const slot = plotW / candles.length;
+  const bodyWidth = Math.max(2, slot * 0.6);
+  const xFor = i => padL + slot * i + slot / 2;
   const yFor = v => padT + plotH - ((v - min) / (max - min)) * plotH;
 
   ctx.fillStyle = '#64748b';
@@ -490,29 +532,40 @@ function drawPriceChart(canvasId, emptyId, data, lineColor) {{
   ctx.fillText(Math.round(max).toLocaleString(), 4, padT + 8);
   ctx.fillText(Math.round(min).toLocaleString(), 4, padT + plotH);
 
-  ctx.strokeStyle = lineColor;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  data.forEach((d, i) => {{
-    const x = xFor(i), y = yFor(d.price);
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  }});
-  ctx.stroke();
+  candles.forEach((c, i) => {{
+    const x = xFor(i);
+    const up = c.close >= c.open;
+    const color = up ? '#16a34a' : '#dc2626';
 
-  const lastX = xFor(data.length - 1), lastY = yFor(values[values.length - 1]);
-  ctx.fillStyle = lineColor;
-  ctx.beginPath();
-  ctx.arc(lastX, lastY, 3.5, 0, Math.PI * 2);
-  ctx.fill();
+    // wick: full high-low range
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, yFor(c.high));
+    ctx.lineTo(x, yFor(c.low));
+    ctx.stroke();
+
+    // body: open-close range, filled
+    const bodyTop = yFor(Math.max(c.open, c.close));
+    const bodyBottom = yFor(Math.min(c.open, c.close));
+    const bodyHeight = Math.max(1, bodyBottom - bodyTop);   // always visible, even for a doji
+    ctx.fillStyle = color;
+    ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
+  }});
+
+  const last = candles[candles.length - 1];
+  const lastX = xFor(candles.length - 1);
+  const lastY = yFor(last.close);
+  ctx.fillStyle = last.close >= last.open ? '#16a34a' : '#dc2626';
   ctx.font = '12px monospace';
   ctx.textAlign = 'right';
-  ctx.fillText(values[values.length - 1].toLocaleString(), lastX - 8, lastY - 8);
+  ctx.fillText(last.close.toLocaleString(), Math.min(lastX + bodyWidth + 50, cssWidth - padR), lastY - 8);
   ctx.textAlign = 'left';
 }}
 
 fetch('/api/nifty-price')
   .then(r => r.json())
-  .then(d => drawPriceChart('niftyChart', 'niftyChartEmpty', d, '#38bdf8'))
+  .then(d => drawCandleChart('niftyChart', 'niftyChartEmpty', d))
   .catch(() => {{
     document.getElementById('niftyChart').style.display = 'none';
     document.getElementById('niftyChartEmpty').style.display = 'block';
@@ -521,7 +574,7 @@ fetch('/api/nifty-price')
 
 fetch('/api/gold-price')
   .then(r => r.json())
-  .then(d => drawPriceChart('goldChart', 'goldChartEmpty', d, '#eab308'))
+  .then(d => drawCandleChart('goldChart', 'goldChartEmpty', d))
   .catch(() => {{
     document.getElementById('goldChart').style.display = 'none';
     document.getElementById('goldChartEmpty').style.display = 'block';
@@ -571,13 +624,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
             elif self.path == "/api/nifty-price":
-                body = json.dumps(get_price_series("NIFTY"), indent=2).encode()
+                candles = build_candles(get_price_series("NIFTY"), group_size=1)
+                body = json.dumps(candles, indent=2).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(body)
             elif self.path == "/api/gold-price":
-                body = json.dumps(get_price_series("GOLD"), indent=2).encode()
+                candles = build_candles(get_price_series("GOLD"), group_size=1)
+                body = json.dumps(candles, indent=2).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
