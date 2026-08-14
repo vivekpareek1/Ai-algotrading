@@ -300,6 +300,12 @@ def render_page(rm: RiskManager) -> str:
                        border: 1px solid #334155; }}
   .price-chart-wrap canvas {{ width: 100%; height: 180px; display: block; }}
   .chart-empty-msg {{ color: #888; text-align: center; padding: 40px 0; }}
+  .timeframe-row {{ display: flex; gap: 6px; margin-bottom: 8px; }}
+  .tf-btn {{ background: #1e293b; color: #94a3b8; border: 1px solid #334155;
+            border-radius: 6px; padding: 4px 12px; font-size: 12px;
+            cursor: pointer; font-family: inherit; }}
+  .tf-btn:hover {{ background: #334155; color: #e2e8f0; }}
+  .tf-btn.active {{ background: #2563eb; color: white; border-color: #2563eb; }}
 </style>
 </head>
 <body>
@@ -328,6 +334,12 @@ def render_page(rm: RiskManager) -> str:
 
   <section>
     <h2>Nifty Index — today's price</h2>
+    <div class="timeframe-row" data-chart="nifty">
+      <button class="tf-btn" data-tf="1">5m</button>
+      <button class="tf-btn active" data-tf="3">15m</button>
+      <button class="tf-btn" data-tf="6">30m</button>
+      <button class="tf-btn" data-tf="12">1h</button>
+    </div>
     <div id="niftyChartWrap" class="price-chart-wrap">
       <canvas id="niftyChart" width="960" height="180"></canvas>
       <div id="niftyChartEmpty" class="chart-empty-msg" style="display:none;">
@@ -338,6 +350,12 @@ def render_page(rm: RiskManager) -> str:
 
   <section>
     <h2>MCX Gold — today's price</h2>
+    <div class="timeframe-row" data-chart="gold">
+      <button class="tf-btn" data-tf="1">5m</button>
+      <button class="tf-btn active" data-tf="3">15m</button>
+      <button class="tf-btn" data-tf="6">30m</button>
+      <button class="tf-btn" data-tf="12">1h</button>
+    </div>
     <div id="goldChartWrap" class="price-chart-wrap">
       <canvas id="goldChart" width="960" height="180"></canvas>
       <div id="goldChartEmpty" class="chart-empty-msg" style="display:none;">
@@ -489,6 +507,33 @@ fetch('/api/equity-curve')
     document.getElementById('chartEmpty').textContent = 'Could not load chart data.';
   }});
 
+function buildCandlesJS(points, step) {{
+  // Mirrors dashboard.py's build_candles() exactly — same windowing, same
+  // boundary-sharing between consecutive candles (each candle's open equals
+  // the prior candle's close, since this is a continuous sampled series with
+  // no real gaps between periods, unlike a stock that can gap overnight).
+  if (!points || points.length < 2) return [];
+  const candles = [];
+  for (let i = step; i < points.length; i += step) {{
+    const window = points.slice(i - step, i + 1);
+    const prices = window.map(p => p.price);
+    candles.push({{
+      time: window[window.length - 1].time,
+      open: window[0].price,
+      close: window[window.length - 1].price,
+      high: Math.max(...prices),
+      low: Math.min(...prices),
+    }});
+  }}
+  return candles;
+}}
+
+function timeLabel(isoLike) {{
+  // collector timestamps look like "2026-08-14 09:15:06" — just want "09:15"
+  const m = String(isoLike).match(/(\\d{{2}}):(\\d{{2}})/);
+  return m ? m[1] + ':' + m[2] : '';
+}}
+
 function drawCandleChart(canvasId, emptyId, candles) {{
   const canvas = document.getElementById(canvasId);
   const emptyMsg = document.getElementById(emptyId);
@@ -510,7 +555,7 @@ function drawCandleChart(canvasId, emptyId, candles) {{
   ctx.scale(dpr, dpr);
   ctx.clearRect(0, 0, cssWidth, cssHeight);
 
-  const padL = 70, padR = 16, padT = 16, padB = 24;
+  const padL = 70, padR = 16, padT = 16, padB = 26;
   const plotW = cssWidth - padL - padR;
   const plotH = cssHeight - padT - padB;
 
@@ -520,8 +565,6 @@ function drawCandleChart(canvasId, emptyId, candles) {{
   const pad = (max - min) * 0.08;
   min -= pad; max += pad;
 
-  // each candle gets an equal slot; body width is most of that slot, leaving
-  // a visible gap between candles like a normal candlestick chart
   const slot = plotW / candles.length;
   const bodyWidth = Math.max(2, slot * 0.6);
   const xFor = i => padL + slot * i + slot / 2;
@@ -537,7 +580,6 @@ function drawCandleChart(canvasId, emptyId, candles) {{
     const up = c.close >= c.open;
     const color = up ? '#16a34a' : '#dc2626';
 
-    // wick: full high-low range
     ctx.strokeStyle = color;
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -545,13 +587,24 @@ function drawCandleChart(canvasId, emptyId, candles) {{
     ctx.lineTo(x, yFor(c.low));
     ctx.stroke();
 
-    // body: open-close range, filled
     const bodyTop = yFor(Math.max(c.open, c.close));
     const bodyBottom = yFor(Math.min(c.open, c.close));
-    const bodyHeight = Math.max(1, bodyBottom - bodyTop);   // always visible, even for a doji
+    const bodyHeight = Math.max(1, bodyBottom - bodyTop);
     ctx.fillStyle = color;
     ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
   }});
+
+  // x-axis time labels — a handful of evenly spaced ticks, not one per
+  // candle (that would overlap and be unreadable with 20+ candles)
+  const maxLabels = Math.min(6, candles.length);
+  const labelStep = Math.max(1, Math.floor(candles.length / maxLabels));
+  ctx.fillStyle = '#64748b';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'center';
+  for (let i = 0; i < candles.length; i += labelStep) {{
+    ctx.fillText(timeLabel(candles[i].time), xFor(i), cssHeight - 6);
+  }}
+  ctx.textAlign = 'left';
 
   const last = candles[candles.length - 1];
   const lastX = xFor(candles.length - 1);
@@ -563,23 +616,36 @@ function drawCandleChart(canvasId, emptyId, candles) {{
   ctx.textAlign = 'left';
 }}
 
-fetch('/api/nifty-price')
-  .then(r => r.json())
-  .then(d => drawCandleChart('niftyChart', 'niftyChartEmpty', d))
-  .catch(() => {{
-    document.getElementById('niftyChart').style.display = 'none';
-    document.getElementById('niftyChartEmpty').style.display = 'block';
-    document.getElementById('niftyChartEmpty').textContent = 'Could not load Nifty price data.';
-  }});
+function setupPriceChart(apiPath, canvasId, emptyId, chartName) {{
+  fetch(apiPath)
+    .then(r => r.json())
+    .then(points => {{
+      const row = document.querySelector('.timeframe-row[data-chart="' + chartName + '"]');
+      const render = step => drawCandleChart(canvasId, emptyId, buildCandlesJS(points, step));
 
-fetch('/api/gold-price')
-  .then(r => r.json())
-  .then(d => drawCandleChart('goldChart', 'goldChartEmpty', d))
-  .catch(() => {{
-    document.getElementById('goldChart').style.display = 'none';
-    document.getElementById('goldChartEmpty').style.display = 'block';
-    document.getElementById('goldChartEmpty').textContent = 'Could not load Gold price data.';
-  }});
+      // default view matches whichever button already has .active in the HTML
+      const activeBtn = row ? row.querySelector('.tf-btn.active') : null;
+      render(activeBtn ? parseInt(activeBtn.dataset.tf, 10) : 3);
+
+      if (row) {{
+        row.querySelectorAll('.tf-btn').forEach(btn => {{
+          btn.addEventListener('click', () => {{
+            row.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            render(parseInt(btn.dataset.tf, 10));
+          }});
+        }});
+      }}
+    }})
+    .catch(() => {{
+      document.getElementById(canvasId).style.display = 'none';
+      document.getElementById(emptyId).style.display = 'block';
+      document.getElementById(emptyId).textContent = 'Could not load ' + chartName + ' price data.';
+    }});
+}}
+
+setupPriceChart('/api/nifty-price', 'niftyChart', 'niftyChartEmpty', 'nifty');
+setupPriceChart('/api/gold-price', 'goldChart', 'goldChartEmpty', 'gold');
 </script>
 </body>
 </html>"""
@@ -624,15 +690,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
             elif self.path == "/api/nifty-price":
-                candles = build_candles(get_price_series("NIFTY"), group_size=1)
-                body = json.dumps(candles, indent=2).encode()
+                # raw points, not pre-grouped: the timeframe buttons regroup
+                # client-side in JS so switching is instant, no re-fetch
+                body = json.dumps(get_price_series("NIFTY"), indent=2).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(body)
             elif self.path == "/api/gold-price":
-                candles = build_candles(get_price_series("GOLD"), group_size=1)
-                body = json.dumps(candles, indent=2).encode()
+                body = json.dumps(get_price_series("GOLD"), indent=2).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
