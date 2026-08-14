@@ -25,6 +25,7 @@ README.md for the exact steps to open that port.
 
 import json
 import base64
+import csv
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -32,6 +33,7 @@ from pathlib import Path
 from risk_manager import RiskManager
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
+JOURNAL_PATH = Path(__file__).parent / "trade_journal.csv"
 PORT = 8080
 
 
@@ -39,6 +41,47 @@ def get_dashboard_password():
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
     return cfg.get("dashboard_password", "changeme")
+
+
+def get_equity_curve(limit=200):
+    """
+    Reads CLOSED trades from trade_journal.csv and returns a cumulative P&L
+    series for charting: [{"time": "...", "pnl": float, "cumulative": float}].
+
+    Uses only the stdlib csv module — the dashboard process has no pandas
+    dependency, and there's no reason to add one just for this.
+
+    limit: keep only the most recent N closed trades, so the chart stays
+    readable and the page doesn't balloon once the journal has thousands
+    of rows.
+    """
+    if not JOURNAL_PATH.exists():
+        return []
+
+    closed = []
+    with open(JOURNAL_PATH, newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("event") != "CLOSED":
+                continue
+            pnl_raw = row.get("pnl", "")
+            try:
+                pnl = float(pnl_raw) if pnl_raw not in ("", None) else None
+            except ValueError:
+                pnl = None
+            if pnl is None:
+                continue  # a CLOSED row with no parseable pnl is unusable for a curve
+            closed.append({"time": row.get("timestamp", ""), "pnl": pnl})
+
+    closed.sort(key=lambda r: r["time"])
+    closed = closed[-limit:]
+
+    running = 0.0
+    curve = []
+    for row in closed:
+        running += row["pnl"]
+        curve.append({"time": row["time"], "pnl": round(row["pnl"], 2),
+                      "cumulative": round(running, 2)})
+    return curve
 
 
 def render_page(rm: RiskManager) -> str:
@@ -175,6 +218,9 @@ def render_page(rm: RiskManager) -> str:
   .reason-box {{ background: #1e293b; border-left: 3px solid {badge_color}; padding: 12px 16px;
                 border-radius: 4px; font-size: 13px; color: #cbd5e1; margin-top: 10px; }}
   .footer {{ color: #64748b; font-size: 11px; margin-top: 30px; text-align: center; }}
+  #chartWrap {{ background: #1e293b; border-radius: 10px; padding: 16px;
+               border: 1px solid #334155; }}
+  #equityChart {{ width: 100%; height: 220px; display: block; }}
 </style>
 </head>
 <body>
@@ -200,6 +246,16 @@ def render_page(rm: RiskManager) -> str:
     <div class="card"><div class="label">Max Daily Loss</div><div class="value">Rs.{status['max_daily_loss_amount']:,.0f}</div></div>
     <div class="card"><div class="label">Capital Deployed</div><div class="value">Rs.{status['capital_deployed']:,.0f}</div></div>
   </div>
+
+  <section>
+    <h2>Equity Curve — cumulative P&amp;L from closed trades</h2>
+    <div id="chartWrap">
+      <canvas id="equityChart" width="960" height="220"></canvas>
+      <div id="chartEmpty" style="display:none;color:#888;text-align:center;padding:40px 0;">
+        No closed trades yet — the chart fills in as trades close.
+      </div>
+    </div>
+  </section>
 
   <section>
     <h2>Open Positions</h2>
@@ -243,6 +299,96 @@ function toggleEngine(state) {{
   if (!confirm(msg)) return;
   fetch('/api/engine/' + state, {{method: 'POST'}}).then(() => location.reload());
 }}
+
+function drawEquityChart(data) {{
+  const canvas = document.getElementById('equityChart');
+  const emptyMsg = document.getElementById('chartEmpty');
+
+  if (!data || data.length === 0) {{
+    canvas.style.display = 'none';
+    emptyMsg.style.display = 'block';
+    return;
+  }}
+  canvas.style.display = 'block';
+  emptyMsg.style.display = 'none';
+
+  // render at device pixel ratio for a crisp line on retina screens, while
+  // the CSS width/height (set in the stylesheet) controls the layout size
+  const dpr = window.devicePixelRatio || 1;
+  const cssWidth = canvas.clientWidth || 960;
+  const cssHeight = 220;
+  canvas.width = cssWidth * dpr;
+  canvas.height = cssHeight * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+  const padL = 60, padR = 16, padT = 16, padB = 28;
+  const plotW = cssWidth - padL - padR;
+  const plotH = cssHeight - padT - padB;
+
+  const values = data.map(d => d.cumulative);
+  let min = Math.min(0, ...values);
+  let max = Math.max(0, ...values);
+  if (min === max) {{ min -= 1; max += 1; }}  // avoid a zero-height plot for a flat/single-point series
+  const pad = (max - min) * 0.08;
+  min -= pad; max += pad;
+
+  const xFor = i => padL + (data.length === 1 ? plotW / 2 : (i / (data.length - 1)) * plotW);
+  const yFor = v => padT + plotH - ((v - min) / (max - min)) * plotH;
+
+  // zero baseline, only drawn if zero actually falls inside the visible range
+  if (min < 0 && max > 0) {{
+    const y0 = yFor(0);
+    ctx.strokeStyle = '#475569';
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(padL, y0);
+    ctx.lineTo(padL + plotW, y0);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#64748b';
+    ctx.font = '11px monospace';
+    ctx.fillText('0', 4, y0 + 4);
+  }}
+
+  // y-axis min/max labels
+  ctx.fillStyle = '#64748b';
+  ctx.font = '11px monospace';
+  ctx.fillText('Rs.' + Math.round(max).toLocaleString(), 4, padT + 8);
+  ctx.fillText('Rs.' + Math.round(min).toLocaleString(), 4, padT + plotH);
+
+  // the line itself — green if the series ends at or above zero, red otherwise
+  const finalValue = values[values.length - 1];
+  ctx.strokeStyle = finalValue >= 0 ? '#16a34a' : '#dc2626';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  data.forEach((d, i) => {{
+    const x = xFor(i), y = yFor(d.cumulative);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }});
+  ctx.stroke();
+
+  // a dot on the most recent point, with its value labelled
+  const lastX = xFor(data.length - 1), lastY = yFor(finalValue);
+  ctx.fillStyle = ctx.strokeStyle;
+  ctx.beginPath();
+  ctx.arc(lastX, lastY, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.font = '12px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText('Rs.' + finalValue.toLocaleString(), lastX - 8, lastY - 8);
+  ctx.textAlign = 'left';
+}}
+
+fetch('/api/equity-curve')
+  .then(r => r.json())
+  .then(drawEquityChart)
+  .catch(() => {{
+    document.getElementById('equityChart').style.display = 'none';
+    document.getElementById('chartEmpty').style.display = 'block';
+    document.getElementById('chartEmpty').textContent = 'Could not load chart data.';
+  }});
 </script>
 </body>
 </html>"""
@@ -276,6 +422,12 @@ class Handler(BaseHTTPRequestHandler):
             rm = RiskManager(str(CONFIG_PATH))
             if self.path == "/api/status":
                 body = json.dumps(rm.get_status(), indent=2).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/api/equity-curve":
+                body = json.dumps(get_equity_curve(), indent=2).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
