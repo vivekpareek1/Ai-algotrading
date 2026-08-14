@@ -63,7 +63,20 @@ POLL_SECONDS = 30  # how often to check price while a trade is open
 CANDLE_LOOKBACK_DAYS = 10  # enough history for indicator warmup (EMA50 etc.)
 
 MARKET_OPEN = dtime(9, 15)
-MARKET_CLOSE = dtime(15, 30)
+MARKET_CLOSE = dtime(15, 40)   # NSE extended F&O close from 15:30 to 15:40 on
+                                # 3 Aug 2026 (Closing Auction Session rollout).
+                                # Index F&O (what we trade) is not itself
+                                # subject to CAS, only the extended close time.
+
+# From 15:15 onward, F&O stocks (most Nifty constituents) stop continuous
+# trading and enter their own closing auction — so the Nifty INDEX value from
+# that point is increasingly built from stale pre-15:15 constituent prices,
+# not fresh trading, even though our option contracts keep trading normally
+# until 15:40. A signal generated from index candles in this window is
+# reading an index that is no longer being freshly priced underneath it.
+# Existing EOD square-off (~15:15-15:20) already exits before this gets bad;
+# this cutoff stops NEW entries from firing into the same stale window.
+NEW_ENTRY_CUTOFF = dtime(15, 15)
 
 
 def login():
@@ -485,8 +498,13 @@ def run_trading_session(obj, instruments, rm):
 
         # --- look for new entry ---
         elif regime != "FLAT" and regime != prev_regime:
-            open_trade = open_new_trade(obj, instruments, rm, signal_eng,
-                                        exit_mgr, last_row, spot, regime, now_str)
+            if datetime.now(IST).time() >= NEW_ENTRY_CUTOFF:
+                print(f"[{now_str}] {regime} signal ignored — past {NEW_ENTRY_CUTOFF} "
+                      f"cutoff (index constituents entering their closing "
+                      f"auction, spot data no longer fresh for a new entry)")
+            else:
+                open_trade = open_new_trade(obj, instruments, rm, signal_eng,
+                                            exit_mgr, last_row, spot, regime, now_str)
 
         prev_regime = regime
         time.sleep(POLL_SECONDS)
