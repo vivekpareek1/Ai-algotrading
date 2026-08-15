@@ -52,6 +52,7 @@ from backtest_real_data import compute_indicators, raw_regime, RegimeConfirmer, 
 from risk_manager import RiskManager
 from signal_engine import SignalEngine, StructureAnalyzer, Direction
 from exit_manager import ExitManager, ExitConfig, Position, MarketState, Side, Action
+from orb_strategy import compute_todays_range, classify_breakout
 from entry_sizing import plan_stops, SizingConfig
 
 CREDS_PATH = Path(__file__).parent / "angel_credentials.json"
@@ -213,12 +214,26 @@ def load_structure(underlying="NIFTY"):
         return None, f"could not parse structure data: {e}"
 
 
-def open_new_trade(obj, instruments, rm, signal_eng, exit_mgr, last_row, spot, regime, now_str):
-    """Price proposes a direction, structure can veto it, then stop levels are
-    reconciled so the reserved risk matches the stop that will actually fire.
-    Returns an open_trade dict, or None."""
+def open_new_trade(obj, instruments, rm, signal_eng, exit_mgr, last_row, spot,
+                   regime, now_str, candle_df=None):
+    """Price proposes a direction, structure can veto it, ORB can veto it too,
+    then stop levels are reconciled so the reserved risk matches the stop
+    that will actually fire. Returns an open_trade dict, or None.
+
+    candle_df: full multi-day candle history (same df the caller already
+    fetched for indicators) — used to compute today's opening range. None
+    is accepted so this function stays testable without ORB wired in."""
     price_direction = Direction.BULLISH if regime == "UP" else Direction.BEARISH
     atr = float(last_row["atr14"])
+
+    orb_direction = Direction.NONE
+    if candle_df is not None:
+        try:
+            orb_range = compute_todays_range(candle_df)
+            orb_direction = classify_breakout(spot, orb_range)
+        except Exception as e:
+            print(f"[{now_str}] ORB computation failed (treating as no "
+                  f"confirmation, not blocking the whole engine): {e}")
 
     structure, err = load_structure("NIFTY")
     if structure is None:
@@ -227,7 +242,7 @@ def open_new_trade(obj, instruments, rm, signal_eng, exit_mgr, last_row, spot, r
             return None
         print(f"[{now_str}] WARNING trading without structure data: {err}")
     else:
-        sig = signal_eng.decide(price_direction, structure, atr)
+        sig = signal_eng.decide(price_direction, structure, atr, orb_direction)
         print(f"[{now_str}] {sig.reason}")
         for v in sig.vetoes:
             print(f"[{now_str}]    veto: {v}")
@@ -504,7 +519,8 @@ def run_trading_session(obj, instruments, rm):
                       f"auction, spot data no longer fresh for a new entry)")
             else:
                 open_trade = open_new_trade(obj, instruments, rm, signal_eng,
-                                            exit_mgr, last_row, spot, regime, now_str)
+                                            exit_mgr, last_row, spot, regime, now_str,
+                                            candle_df=df)
 
         prev_regime = regime
         time.sleep(POLL_SECONDS)

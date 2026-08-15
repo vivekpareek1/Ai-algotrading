@@ -244,11 +244,16 @@ class SignalEngine:
         self.analyzer = StructureAnalyzer(self.cfg)
 
     def decide(self, price_direction: Direction, structure: StructureRead,
-               atr: float) -> SignalDecision:
+               atr: float, orb_direction: Direction = Direction.NONE) -> SignalDecision:
         """
         price_direction: what the existing EMA/RSI/MACD/ADX confluence concluded.
         structure:       output of StructureAnalyzer.
         atr:             current ATR on the underlying, for wall-distance sizing.
+        orb_direction:    output of orb_strategy.classify_breakout(), or
+                          Direction.NONE if the opening range isn't complete yet,
+                          or if orb_strategy isn't wired in by the caller at all.
+                          Passed in rather than computed here to avoid a circular
+                          import (orb_strategy imports Direction from this module).
         """
         if price_direction is Direction.NONE:
             return SignalDecision(False, Direction.NONE, None,
@@ -311,6 +316,19 @@ class SignalEngine:
             if not bullish and structure.pcr_oi >= self.cfg.pcr_extreme_high:
                 vetoes.append(f"PCR {structure.pcr_oi:.2f} is put-crowded — "
                               f"poor risk/reward for a fresh PE")
+
+        # --- VETO 5: opening range not broken yet -----------------------------
+        # ORB is a genuinely price-only signal (no OI/basis involved), so it
+        # slots in as its own veto rather than being folded into the price
+        # confluence itself — keeps the two strategies independently
+        # inspectable in the decision trail instead of blended into one score.
+        if orb_direction is Direction.NONE:
+            vetoes.append("opening range not yet broken (or still forming) — "
+                          "no ORB confirmation for this direction")
+        elif orb_direction is not price_direction:
+            vetoes.append(f"ORB shows {orb_direction.value.lower()}, "
+                          f"contradicting the {price_direction.value.lower()} "
+                          f"price signal")
 
         if vetoes:
             return SignalDecision(False, Direction.NONE, None,
